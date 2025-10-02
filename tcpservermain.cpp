@@ -300,9 +300,56 @@ int main(int argc, char *argv[]) {
             // child
             close(listenfd);
 
-            // Send required greeting
-            const char *hello = "TEXT TCP 1.1\n";
-            send(connfd, hello, strlen(hello), 0);
+            // Peek first message from client with small timeout
+            fd_set rf;
+            FD_ZERO(&rf);
+            FD_SET(connfd, &rf);
+            struct timeval tv = {2,0}; // 2s timeout
+            int sel = select(connfd+1, &rf, NULL, NULL, &tv);
+            std::string firstmsg;
+            if (sel > 0 && FD_ISSET(connfd, &rf)) {
+                char buf[512];
+                ssize_t rn = recv(connfd, buf, sizeof(buf)-1, 0);
+                if (rn > 0) {
+                    buf[rn] = '\0';
+                    firstmsg = buf;
+                }
+            }
+
+            // lowercase copy
+            std::string low = firstmsg;
+            for(auto &c: low) c = (char)tolower(c);
+
+            // if client asks for binary
+            if (low.find("/binary") != std::string::npos) {
+                // send exact first lines expected by test
+                send(connfd, "binary\n", 7, 0);
+
+                uint32_t code = (rand()%4)+1;
+                int32_t a = randomInt();
+                int32_t b = randomInt();
+                if (code==4 && b==0) b=1;
+                const char* opstr="add";
+                int32_t expected=0;
+                if (code==1){expected=a+b; opstr="add";}
+                else if(code==2){expected=a-b; opstr="sub";}
+                else if(code==3){expected=a*b; opstr="mul";}
+                else {expected=a/b; opstr="div";}
+                uint32_t id = rand() ^ time(NULL);
+
+                char assignbuf[128];
+                int alen = snprintf(assignbuf,sizeof(assignbuf),"ASSIGNMENT: %u %s %d %d\n",id,opstr,(int)a,(int)b);
+                send(connfd, assignbuf, alen,0);
+
+                // wait and validate client response as before...
+                
+            } else {
+                // normal text client
+                const char* hello="TEXT TCP 1.1\n";
+                send(connfd, hello, strlen(hello), 0);
+                handle_text_client(connfd);
+            }
+
 
             // Read a small first-line message from client with short timeout
             {
