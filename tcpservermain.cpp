@@ -303,6 +303,16 @@ int main(int argc, char *argv[]) {
     const char* hello = "TEXT TCP 1.1\n";
     send(connfd, hello, strlen(hello), 0);
 
+    // Generate and send a math assignment/task to the client
+    // Randomly pick an operation and operands
+    const char* ops[] = {"add", "sub", "mul", "div"};
+    int op_idx = rand() % 4;
+    int a = randomInt();
+    int b = (op_idx == 3) ? (randomInt() ? randomInt() : 1) : randomInt(); // avoid div by 0
+    char assignbuf[128];
+    snprintf(assignbuf, sizeof(assignbuf), "%s %d %d\n", ops[op_idx], a, b);
+    send(connfd, assignbuf, strlen(assignbuf), 0);
+
     // Now read the first line from client to check if it's binary
     std::string line;
     ssize_t r = recv_line(connfd, line); // blocking
