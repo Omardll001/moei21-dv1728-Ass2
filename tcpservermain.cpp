@@ -318,7 +318,7 @@ int main(int argc, char *argv[]) {
     ssize_t r = recv_line(connfd, line); // blocking
     std::string low = line;
     for(auto &c: low) c = (char)tolower(c);
-
+        // check if line contains "/binary"
     if(low.find("/binary") != std::string::npos) {
         // Binary client
         const char* bin_hello = "BINARY TCP 1.1\n";
