@@ -299,9 +299,9 @@ int main(int argc, char *argv[]) {
         } else if(pid == 0) {
             close(listenfd);
 
-	// Immediately send greeting for all clients
-	const char* hello = "TEXT TCP 1.0\n";
-	send(connfd, hello, strlen(hello), 0);
+    // Immediately send greeting for all clients
+    const char* hello = "TEXT TCP 1.1\n";
+    send(connfd, hello, strlen(hello), 0);
 
 	// Now read the first line from client to check if it's binary
 	std::string line;
