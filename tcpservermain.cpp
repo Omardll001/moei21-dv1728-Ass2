@@ -299,45 +299,45 @@ int main(int argc, char *argv[]) {
         } else if(pid == 0) {
             close(listenfd);
 
-            // Peek first message (non-blocking)
-            char peekbuf[512];
-            ssize_t n = recv(connfd, peekbuf, sizeof(peekbuf)-1, MSG_PEEK | MSG_DONTWAIT);
-            std::string firstmsg;
-            if(n>0){ peekbuf[n]=0; firstmsg = peekbuf; }
-            std::string low = firstmsg;
+            // Immediately send greeting for all non-binary clients
+            const char* hello = "TEXT TCP 1.1\n";
+            send(connfd, hello, strlen(hello), 0);
+
+            // Now read the first line from client to check if it's binary
+            std::string line;
+            ssize_t r = recv_line(connfd, line); // blocking
+            std::string low = line;
             for(auto &c: low) c = (char)tolower(c);
 
             if(low.find("/binary") != std::string::npos) {
-                // Binary client: first line must be "binary\n"
+                // Binary client
                 send(connfd, "binary\n", 7, 0);
 
-                // generate assignment task
+                // generate assignment task ...
                 uint32_t code = (rand()%4)+1;
                 int32_t a = randomInt();
-                int32_t b = randomInt();
-                if(code==4 && b==0) b=1;
-                int32_t expected=0;
-                const char* opstr="add";
+                int32_t b = (code==4)? (randomInt()|1) : randomInt(); // avoid div by 0
+                int32_t expected = 0;
+                const char* opstr = "add";
                 if(code==1){ expected=a+b; opstr="add";}
                 else if(code==2){ expected=a-b; opstr="sub";}
                 else if(code==3){ expected=a*b; opstr="mul";}
                 else{ expected=a/b; opstr="div";}
-                uint32_t id = rand()^time(NULL);
+                uint32_t id = rand() ^ time(NULL);
 
                 char assignbuf[128];
                 int alen = snprintf(assignbuf,sizeof(assignbuf),
                                     "ASSIGNMENT: %u %s %d %d\n", id, opstr,(int)a,(int)b);
                 send(connfd, assignbuf, alen, 0);
 
-                // wait and validate client reply...
-                
-            } else {
-                // Normal text client: immediately send greeting
-                const char* hello="TEXT TCP 1.1\n";
-                send(connfd, hello, strlen(hello), 0);
+                // then handle binary client protocol ...
+                handle_binary_client(connfd);
 
+            } else {
+                // Normal text client: continue handling
                 handle_text_client(connfd);
             }
+
             close(connfd);
             _exit(0);
         }
