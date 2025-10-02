@@ -299,27 +299,24 @@ int main(int argc, char *argv[]) {
         } else if(pid == 0) {
             close(listenfd);
 
-    // Immediately send greeting for all clients
-    const char* hello = "TEXT TCP 1.1\n";
-    send(connfd, hello, strlen(hello), 0);
+    // Read the first line from client to check if it's binary
+    std::string line;
+    ssize_t r = recv_line(connfd, line); // blocking
+    std::string low = line;
+    for(auto &c: low) c = (char)tolower(c);
 
-	// Now read the first line from client to check if it's binary
-	std::string line;
-	ssize_t r = recv_line(connfd, line); // blocking
-	std::string low = line;
-	for(auto &c: low) c = (char)tolower(c);
-
-	if(low.find("/binary") != std::string::npos) {
-		// Binary client
-		const char* bin_hello = "BINARY TCP 1.0\n";
-		send(connfd, bin_hello, strlen(bin_hello), 0);
-
-		// then handle binary client protocol ...
-		handle_binary_client(connfd);
-	} else {
-		// Normal text client: continue handling
-		handle_text_client(connfd);
-	}
+    if(low.find("/binary") != std::string::npos) {
+        // Binary client
+        const char* bin_hello = "BINARY TCP 1.1\n";
+        send(connfd, bin_hello, strlen(bin_hello), 0);
+        // then handle binary client protocol ...
+        handle_binary_client(connfd);
+    } else {
+        // Normal text client: send correct greeting and continue handling
+        const char* hello = "TEXT TCP 1.1\n";
+        send(connfd, hello, strlen(hello), 0);
+        handle_text_client(connfd);
+    }
 
             close(connfd);
             _exit(0);
