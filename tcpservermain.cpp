@@ -292,125 +292,105 @@ int main(int argc, char *argv[]) {
             continue;
         }
         pid_t pid = fork();
-if (pid < 0) {
-    perror("fork");
-    close(connfd);
-    continue;
-} else if (pid == 0) {
-    // Child process
-    close(listenfd);
-
-    // Send greeting
-    const char *hello = "TEXT TCP 1.1\n";
-    send(connfd, hello, strlen(hello), 0);
-
-    // Wait for initial client message (short timeout)
-    fd_set rf;
-    FD_ZERO(&rf);
-    FD_SET(connfd, &rf);
-    struct timeval tv;
-    tv.tv_sec = 2; // 2s timeout
-    tv.tv_usec = 0;
-    int sel = select(connfd+1, &rf, NULL, NULL, &tv);
-    if (sel <= 0 || !FD_ISSET(connfd, &rf)) {
-        close(connfd);
-        _exit(0);
-    }
-
-    char firstbuf[512];
-    ssize_t rn = recv(connfd, firstbuf, sizeof(firstbuf)-1, 0);
-    if (rn <= 0) { close(connfd); _exit(0); }
-    firstbuf[rn] = '\0';
-    std::string firstmsg(firstbuf);
-    std::string low = firstmsg;
-    for (auto &c : low) c = (char)tolower(c);
-
-    // Handle /binary path request
-    if (low.find("/binary") != std::string::npos ||
-        low.find("path = binary") != std::string::npos ||
-        low.find("path=binary") != std::string::npos) {
-
-        // Generate random arithmetic assignment
-        int code = (rand()%4)+1; // 1=add,2=sub,3=mul,4=div
-        int a = randomInt();
-        int b = randomInt();
-        if (code == 4 && b == 0) b = 1; // avoid div by zero
-
-        int expected = 0;
-        const char *opstr = "add";
-        switch(code) {
-            case 1: expected = a + b; opstr="add"; break;
-            case 2: expected = a - b; opstr="sub"; break;
-            case 3: expected = a * b; opstr="mul"; break;
-            case 4: expected = a / b; opstr="div"; break;
-        }
-        uint32_t id = (uint32_t)(rand() ^ time(NULL));
-
-        // Send textual binary protocol header
-        send(connfd, "binary\n", 7, 0);
-
-        // Send assignment
-        char assignbuf[128];
-        int alen = snprintf(assignbuf, sizeof(assignbuf),
-                            "ASSIGNMENT: %u %s %d %d\n", id, opstr, a, b);
-        send(connfd, assignbuf, alen, 0);
-
-        // Read client reply (single line)
-        std::string replyline;
-        ssize_t got = recv_line(connfd, replyline);
-        if (got <= 0) {
-            send(connfd, "ERROR TO\n", 9, 0);
+        if (pid < 0) {
+            perror("fork");
             close(connfd);
-            _exit(1);
-        }
+            continue;
+        } else if (pid == 0) {
+            // Child process
+            close(listenfd);
 
-        int client_res = 0;
-        if (sscanf(replyline.c_str(), "%d", &client_res) != 1) {
-            send(connfd, "ERROR PARSE\n", 12, 0);
-            close(connfd);
-            _exit(1);
-        }
+            // Send greeting
+            const char *hello = "TEXT TCP 1.1\n";
+            send(connfd, hello, strlen(hello), 0);
 
-        // Respond with OK or NOT OK
-        char resultbuf[128];
-        if (client_res == expected) {
-            int n = snprintf(resultbuf, sizeof(resultbuf), "OK (myresult=%d)\n", client_res);
-            send(connfd, resultbuf, n, 0);
-        } else {
-            int n = snprintf(resultbuf, sizeof(resultbuf), "NOT OK (myresult=%d)\n", client_res);
-            send(connfd, resultbuf, n, 0);
-        }
-
-        close(connfd);
-        _exit(0);
-    }
-
-    // Otherwise handle normal text client
-    handle_text_client(connfd);
-    close(connfd);
-    _exit(0);
-}
-          else if (pid > 0) {
-            // FALLBACK: Peek and decide text vs binary as before
-            char buf[512];
-            ssize_t n = recv(connfd, buf, sizeof(buf), MSG_PEEK | MSG_DONTWAIT);
-            if (n <= 0) {
+            // Wait for initial client message (short timeout)
+            fd_set rf;
+            FD_ZERO(&rf);
+            FD_SET(connfd, &rf);
+            struct timeval tv;
+            tv.tv_sec = 2; // 2s timeout
+            tv.tv_usec = 0;
+            int sel = select(connfd+1, &rf, NULL, NULL, &tv);
+            if (sel <= 0 || !FD_ISSET(connfd, &rf)) {
                 close(connfd);
                 _exit(0);
             }
-            bool allprint = true;
-            for (ssize_t i=0;i<n;i++) {
-                unsigned char c = buf[i];
-                if (c < 9 || (c>13 && c<32)) { allprint = false; break; }
+
+            char firstbuf[512];
+            ssize_t rn = recv(connfd, firstbuf, sizeof(firstbuf)-1, 0);
+            if (rn <= 0) { close(connfd); _exit(0); }
+            firstbuf[rn] = '\0';
+            std::string firstmsg(firstbuf);
+            std::string low = firstmsg;
+            for (auto &c : low) c = (char)tolower(c);
+
+            // Handle /binary path request
+            if (low.find("/binary") != std::string::npos ||
+                low.find("path = binary") != std::string::npos ||
+                low.find("path=binary") != std::string::npos) {
+
+                // Generate random arithmetic assignment
+                int code = (rand()%4)+1; // 1=add,2=sub,3=mul,4=div
+                int a = randomInt();
+                int b = randomInt();
+                if (code == 4 && b == 0) b = 1; // avoid div by zero
+
+                int expected = 0;
+                const char *opstr = "add";
+                switch(code) {
+                    case 1: expected = a + b; opstr="add"; break;
+                    case 2: expected = a - b; opstr="sub"; break;
+                    case 3: expected = a * b; opstr="mul"; break;
+                    case 4: expected = a / b; opstr="div"; break;
+                }
+                uint32_t id = (uint32_t)(rand() ^ time(NULL));
+
+                // Send textual binary protocol header
+                send(connfd, "binary\n", 7, 0);
+
+                // Send assignment
+                char assignbuf[128];
+                int alen = snprintf(assignbuf, sizeof(assignbuf),
+                                    "ASSIGNMENT: %u %s %d %d\n", id, opstr, a, b);
+                send(connfd, assignbuf, alen, 0);
+
+                // Read client reply (single line)
+                std::string replyline;
+                ssize_t got = recv_line(connfd, replyline);
+                if (got <= 0) {
+                    send(connfd, "ERROR TO\n", 9, 0);
+                    close(connfd);
+                    _exit(1);
+                }
+
+                int client_res = 0;
+                if (sscanf(replyline.c_str(), "%d", &client_res) != 1) {
+                    send(connfd, "ERROR PARSE\n", 12, 0);
+                    close(connfd);
+                    _exit(1);
+                }
+
+                // Respond with OK or NOT OK
+                char resultbuf[128];
+                if (client_res == expected) {
+                    int n = snprintf(resultbuf, sizeof(resultbuf), "OK (myresult=%d)\n", client_res);
+                    send(connfd, resultbuf, n, 0);
+                } else {
+                    int n = snprintf(resultbuf, sizeof(resultbuf), "NOT OK (myresult=%d)\n", client_res);
+                    send(connfd, resultbuf, n, 0);
+                }
+
+                close(connfd);
+                _exit(0);
             }
-            if (!allprint && n >= (ssize_t)sizeof(calcProtocol)) {
-                handle_binary_client(connfd);
-            } else {
-                handle_text_client(connfd);
-            }
+
+            // Otherwise handle normal text client
+            handle_text_client(connfd);
             close(connfd);
             _exit(0);
-        } // end child
+        }
+
 
           else {
             // parent
