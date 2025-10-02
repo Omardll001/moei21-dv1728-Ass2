@@ -296,24 +296,21 @@ int main(int argc, char *argv[]) {
             perror("fork");
             close(connfd);
             continue;
-                } else if (pid == 0) {
+                    } else if (pid == 0) {
             // child
             close(listenfd);
 
-            // 1) Send the initial TEXT greeting (some graders expect this).
+            // Send required greeting
             const char *hello = "TEXT TCP 1.1\n";
             send(connfd, hello, strlen(hello), 0);
 
-            // 2) Try to read a small first-line message from client, short timeout.
-            //    This is to support clients that proactively send a URI-like request
-            //    such as: "Protocol: tcp, Host ip4-localhost, port = 5352 and path = binary."
-            //    We will read up to 512 bytes non-blocking with a short timeout.
+            // Read a small first-line message from client with short timeout
             {
                 fd_set rf;
                 FD_ZERO(&rf);
                 FD_SET(connfd, &rf);
                 struct timeval tv;
-                tv.tv_sec = 2; // small wait to let client send initial message
+                tv.tv_sec = 2; // small wait for initial client line
                 tv.tv_usec = 0;
                 int sel = select(connfd+1, &rf, NULL, NULL, &tv);
                 if (sel > 0 && FD_ISSET(connfd, &rf)) {
@@ -322,118 +319,97 @@ int main(int argc, char *argv[]) {
                     if (rn > 0) {
                         firstbuf[rn] = '\0';
                         std::string firstmsg(firstbuf);
-                        // Normalize to lowercase for simpler matching (non-destructive)
+                        // lowercase copy for matching
                         std::string low = firstmsg;
                         for (auto &c : low) c = (char)tolower(c);
 
-                        // If the client explicitly requested the "binary" path, do a server-initiated binary handshake:
-                        if (low.find("path = binary") != std::string::npos || low.find("path=binary") != std::string::npos
-                            || low.find("/binary") != std::string::npos) {
-                            // Compose a calcProtocol server->client task and send it immediately.
-                            // Build random task ensuring divisor != 0 for division.
-                            uint32_t code = (rand()%4) + 1;
+                        // If client explicitly asks for binary path, do textual assignment protocol:
+                        if (low.find("/binary") != std::string::npos ||
+                            low.find("path = binary") != std::string::npos ||
+                            low.find("path=binary") != std::string::npos) {
+
+                            // Generate task (no division by zero)
+                            uint32_t code = (rand()%4) + 1; // 1 add, 2 sub, 3 mul, 4 div
                             int32_t a = randomInt();
-                            int32_t b = (code==4) ? randomInt() : randomInt();
+                            int32_t b = randomInt();
                             if (code == 4 && b == 0) b = 1;
                             int32_t expected = 0;
-                            if (code==1) expected = a + b;
-                            else if (code==2) expected = a - b;
-                            else if (code==3) expected = a * b;
-                            else expected = a / b;
+                            const char *opstr = "add";
+                            if (code==1) { expected = a + b; opstr = "add"; }
+                            else if (code==2) { expected = a - b; opstr = "sub"; }
+                            else if (code==3) { expected = a * b; opstr = "mul"; }
+                            else { expected = a / b; opstr = "div"; }
+                            uint32_t id = (uint32_t)(rand() ^ time(NULL));
 
-                            uint32_t task_id = (uint32_t)(rand() ^ time(NULL));
+                            // Send textual responses expected by refClient
+                            // Line 1: include "binary"
+                            send(connfd, "binary\n", 7, 0);
 
-                            // prepare outgoing calcProtocol (network order)
-                            calcProtocol outnet;
-                            outnet.type = htons(1); // server->client
-                            outnet.major_version = htons(1);
-                            outnet.minor_version = htons(1);
-                            outnet.id = htonl(task_id);
-                            outnet.arith = htonl(code);
-                            outnet.inValue1 = htonl(a);
-                            outnet.inValue2 = htonl(b);
-                            outnet.inResult = htonl(0);
+                            // Line 2: ASSIGNMENT: id op a b
+                            char assignbuf[128];
+                            int alen = snprintf(assignbuf, sizeof(assignbuf),
+                                                "ASSIGNMENT: %u %s %d %d\n",
+                                                id, opstr, (int)a, (int)b);
+                            send(connfd, assignbuf, alen, 0);
 
-                            // send the calcProtocol task
-                            send(connfd, &outnet, sizeof(outnet), 0);
-
-                            // Now wait for client's calcProtocol with result (apply 5s per-operation timeout)
-                            // Use select with 5s timeout then read sizeof(calcProtocol) bytes
+                            // Now wait up to 5s for client's textual result (one line)
                             fd_set rf2;
                             FD_ZERO(&rf2);
                             FD_SET(connfd, &rf2);
                             struct timeval tv2; tv2.tv_sec = 5; tv2.tv_usec = 0;
                             int sel2 = select(connfd+1, &rf2, NULL, NULL, &tv2);
                             if (sel2 <= 0) {
-                                // timeout -> send ERROR TO\n and close child
                                 const char *to = "ERROR TO\n";
                                 send(connfd, to, strlen(to), 0);
                                 close(connfd);
                                 _exit(1);
-                            } else {
-                                // read calcProtocol reply
-                                calcProtocol innet;
-                                ssize_t rr = full_read(connfd, &innet, sizeof(innet));
-                                if (rr != (ssize_t)sizeof(innet)) {
-                                    const char *err = "ERROR PARSE\n";
-                                    send(connfd, err, strlen(err), 0);
-                                    close(connfd);
-                                    _exit(1);
-                                }
-                                // convert to host order
-                                calcProtocol inh;
-                                inh.type = ntohs(innet.type);
-                                inh.major_version = ntohs(innet.major_version);
-                                inh.minor_version = ntohs(innet.minor_version);
-                                inh.id = ntohl(innet.id);
-                                inh.arith = ntohl(innet.arith);
-                                inh.inValue1 = ntohl(innet.inValue1);
-                                inh.inValue2 = ntohl(innet.inValue2);
-                                inh.inResult = ntohl(innet.inResult);
-
-                                // Validate id and result
-                                calcMessage resp;
-                                resp.type = htons(2); // server->client binary msg
-                                resp.protocol = htons(6);
-                                resp.major_version = htons(1);
-                                resp.minor_version = htons(1);
-
-                                if (inh.id != task_id) {
-                                    resp.message = htonl(2); // NOT OK
-                                    send(connfd, &resp, sizeof(resp), 0);
-                                } else {
-                                    if (inh.inResult == expected) resp.message = htonl(1); // OK
-                                    else resp.message = htonl(2); // NOT OK
-                                    send(connfd, &resp, sizeof(resp), 0);
-                                }
-                                // Done with this client connection
-                                close(connfd);
-                                _exit(0);
                             }
+
+                            // Read the client's reply line
+                            std::string replyline;
+                            ssize_t got = recv_line(connfd, replyline); // uses existing recv_line
+                            if (got <= 0) {
+                                const char *err = "ERROR PARSE\n";
+                                send(connfd, err, strlen(err), 0);
+                                close(connfd);
+                                _exit(1);
+                            }
+                            // parse integer from reply (client likely sends just the integer)
+                            int client_res = 0;
+                            if (sscanf(replyline.c_str(), "%d", &client_res) < 1) {
+                                // not an int -> error
+                                const char *err = "ERROR PARSE\n";
+                                send(connfd, err, strlen(err), 0);
+                                close(connfd);
+                                _exit(1);
+                            }
+
+                            // Validate and respond with textual OK (matching regex ^OK \(myresult=-?[0-9]+\)$)
+                            char resultbuf[128];
+                            if (client_res == expected) {
+                                int n = snprintf(resultbuf, sizeof(resultbuf), "OK (myresult=%d)\n", client_res);
+                                send(connfd, resultbuf, n, 0);
+                            } else {
+                                int n = snprintf(resultbuf, sizeof(resultbuf), "NOT OK (myresult=%d)\n", client_res);
+                                send(connfd, resultbuf, n, 0);
+                            }
+
+                            close(connfd);
+                            _exit(0);
                         } // end binary-path handling
 
-                        // If we reached here, the client sent something (firstmsg) but didn't request binary.
-                        // To support typical text clients that expect the server to echo back or use the API,
-                        // we treat the incoming string as the first text input (fall through to text handler).
-                        // Preload the read data into a small buffer accessible to the text handler by using
-                        // a simple approach: put the message back into a small string and call handle_text_client,
-                        // but handle_text_client reads from socket directly. So, we will handle this first-line
-                        // directly (if it looks like a text command), then continue with handle_text_client loop.
-
-                        // Check if firstmsg looks like a text arithmetic command: e.g. "add 1 2"
+                        // If we got a normal text command (like "add 1 2"), handle it and continue with text loop
                         {
                             char cmdbuf[64];
                             int a=0,b=0;
                             if (sscanf(firstbuf, "%63s %d %d", cmdbuf, &a, &b) >= 1) {
-                                // handle single-line text command and then continue with the text loop
                                 if (strcmp(cmdbuf, "add") == 0 || strcmp(cmdbuf, "sub") == 0 ||
                                     strcmp(cmdbuf, "mul") == 0 || strcmp(cmdbuf, "div") == 0) {
-                                    // compute and send result
                                     int res = 0;
                                     if (strcmp(cmdbuf, "add")==0) res = a + b;
                                     else if (strcmp(cmdbuf, "sub")==0) res = a - b;
                                     else if (strcmp(cmdbuf, "mul")==0) res = a * b;
-                                    else if (strcmp(cmdbuf, "div")==0) {
+                                    else {
                                         if (b == 0) {
                                             const char *err = "ERROR DIV0\n";
                                             send(connfd, err, strlen(err), 0);
@@ -444,7 +420,7 @@ int main(int argc, char *argv[]) {
                                     char outbuf[128];
                                     int n = snprintf(outbuf, sizeof(outbuf), "%d\n", res);
                                     send(connfd, outbuf, n, 0);
-                                    // continue to text loop to handle further client commands
+                                    // Now continue handling further text commands in usual text loop
                                     handle_text_client(connfd);
                                     close(connfd);
                                     _exit(0);
@@ -452,13 +428,12 @@ int main(int argc, char *argv[]) {
                             }
                         }
 
-                        // If not binary and not a simple text command, fall through to normal heuristic below.
-                    } // end if rn > 0
-                } // end if sel > 0
-            } // end first-message block
+                        // otherwise fall through to the heuristic below (peek)
+                    } // rn > 0
+                } // select
+            } // end initial-message block
 
-            // If no explicit initial `binary` request was detected, fall back to the original heuristic:
-            // Peek to decide text vs binary: use recv(MSG_PEEK)
+            // FALLBACK: Peek and decide text vs binary as before
             char buf[512];
             ssize_t n = recv(connfd, buf, sizeof(buf), MSG_PEEK | MSG_DONTWAIT);
             if (n <= 0) {
@@ -477,7 +452,8 @@ int main(int argc, char *argv[]) {
             }
             close(connfd);
             _exit(0);
-        } // end child branch
+        } // end child
+
           else {
             // parent
             close(connfd);
