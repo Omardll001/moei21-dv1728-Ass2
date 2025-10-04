@@ -346,7 +346,7 @@ void handle_text_client(int fd) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s host:port\n", argv[0]);
+        fprintf(stderr, "Usage: %s host:port [text|binary]\n", argv[0]);
         exit(EXIT_FAILURE);
     }
     initCalcLib();
@@ -380,7 +380,13 @@ int main(int argc, char *argv[]) {
     
     // Ignore SIGPIPE to avoid crashes on broken pipes
     signal(SIGPIPE, SIG_IGN);
-    
+
+    // Decide protocol mode
+    bool force_binary = false;
+    if (argc >= 3 && strcmp(argv[2], "binary") == 0) {
+        force_binary = true;
+    }
+
     while (1) {
         struct sockaddr_storage cliaddr;
         socklen_t clilen = sizeof(cliaddr);
@@ -399,29 +405,7 @@ int main(int argc, char *argv[]) {
         } else if (pid == 0) {
             close(listenfd);
 
-            // Set non-blocking mode
-            int flags = fcntl(connfd, F_GETFL, 0);
-            fcntl(connfd, F_SETFL, flags | O_NONBLOCK);
-
-            // Try to peek at the first bytes
-            char peekbuf[sizeof(calcProtocol)];
-            ssize_t r = recv(connfd, peekbuf, sizeof(peekbuf), MSG_PEEK);
-
-            // Restore blocking mode
-            fcntl(connfd, F_SETFL, flags);
-
-            bool is_binary = false;
-            if (r >= (ssize_t)sizeof(calcProtocol)) {
-                calcProtocol *cp = (calcProtocol*)peekbuf;
-                uint16_t type = ntohs(cp->type);
-                uint16_t major = ntohs(cp->major_version);
-                uint16_t minor = ntohs(cp->minor_version);
-                if (major == 1 && minor == 1 && (type == 21 || type == 22)) {
-                    is_binary = true;
-                }
-            }
-
-            if (is_binary) {
+            if (force_binary) {
                 handle_binary_client(connfd);
             } else {
                 handle_text_client(connfd);
