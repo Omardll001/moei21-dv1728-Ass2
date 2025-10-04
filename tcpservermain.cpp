@@ -90,101 +90,6 @@ int setup_listener(const char *host, const char *port) {
     return listenfd;
 }
 
-void handle_binary_client(int fd);
-
-void handle_text_client(int fd) {
-    conn_fd_for_alarm = fd;
-    signal(SIGALRM, alarm_handler);
-
-    // Send TEXT TCP 1.1 greeting immediately
-    const char *greeting = "TEXT TCP 1.1\n";
-    alarm(5);
-    ssize_t sent = write(fd, greeting, strlen(greeting));
-    alarm(0);
-    
-    if (sent != (ssize_t)strlen(greeting)) {
-        close(fd);
-        return;
-    }
-
-    // Peek at the first bytes to check for binary protocol
-    char peekbuf[sizeof(calcProtocol)];
-    alarm(5);
-    ssize_t r = recv(fd, peekbuf, sizeof(peekbuf), MSG_PEEK);
-    alarm(0);
-    if (r >= (ssize_t)sizeof(calcProtocol)) {
-        calcProtocol *cp = (calcProtocol*)peekbuf;
-        uint16_t type = ntohs(cp->type);
-        uint16_t major = ntohs(cp->major_version);
-        uint16_t minor = ntohs(cp->minor_version);
-        if (major == 1 && minor == 1 && (type == 21 || type == 22)) {
-            // It's binary, switch handler
-            handle_binary_client(fd);
-            return;
-        }
-    }
-
-    while (1) {
-        // Generate task
-        int code = (rand() % 4) + 1;
-        int a = randomInt();
-        int b = (code == 4) ? ((randomInt() == 0) ? 1 : randomInt()) : randomInt();
-        if (code == 4 && b == 0) b = 1;
-        
-        const char *opstr = "add";
-        if (code == 1) opstr = "add";
-        else if (code == 2) opstr = "sub";
-        else if (code == 3) opstr = "mul";
-        else opstr = "div";
-
-        char task[128];
-        int task_len = snprintf(task, sizeof(task), "%s %d %d\n", opstr, a, b);
-        
-        alarm(5);
-        ssize_t sent = write(fd, task, task_len);
-        alarm(0);
-        if (sent != task_len) break;
-
-        // Wait for answer
-        std::string line;
-        alarm(5);
-        ssize_t r = recv_line(fd, line);
-        alarm(0);
-        if (r <= 0) break;
-
-        // Trim newline
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) 
-            line.pop_back();
-
-        // Calculate expected result
-        int expected = 0;
-        if (code == 1) expected = a + b;
-        else if (code == 2) expected = a - b;
-        else if (code == 3) expected = a * b;
-        else if (code == 4) expected = a / b;
-
-        // Parse and validate answer
-        int answer = 0;
-        if (sscanf(line.c_str(), "%d", &answer) == 1) {
-            if (answer == expected) {
-                alarm(5);
-                write(fd, "OK\n", 3);
-                alarm(0);
-            } else {
-                alarm(5);
-                write(fd, "NOT OK\n", 7);
-                alarm(0);
-            }
-        } else {
-            alarm(5);
-            write(fd, "ERROR PARSE\n", 12);
-            alarm(0);
-        }
-    }
-    close(fd);
-}
-
-
 void handle_binary_client(int fd) {
     conn_fd_for_alarm = fd;
     signal(SIGALRM, alarm_handler);
@@ -341,6 +246,98 @@ void handle_binary_client(int fd) {
             snprintf(nokline, sizeof(nokline), "NOT OK (invalid type)\n");
             alarm(5);
             write(fd, nokline, strlen(nokline));
+            alarm(0);
+        }
+    }
+    close(fd);
+}
+
+void handle_text_client(int fd) {
+    conn_fd_for_alarm = fd;
+    signal(SIGALRM, alarm_handler);
+
+    // Send TEXT TCP 1.1 greeting immediately
+    const char *greeting = "TEXT TCP 1.1\n";
+    alarm(5);
+    ssize_t sent = write(fd, greeting, strlen(greeting));
+    alarm(0);
+    
+    if (sent != (ssize_t)strlen(greeting)) {
+        close(fd);
+        return;
+    }
+
+    // Peek at the first bytes to check for binary protocol
+    char peekbuf[sizeof(calcProtocol)];
+    alarm(5);
+    ssize_t r = recv(fd, peekbuf, sizeof(peekbuf), MSG_PEEK);
+    alarm(0);
+    if (r >= (ssize_t)sizeof(calcProtocol)) {
+        calcProtocol *cp = (calcProtocol*)peekbuf;
+        uint16_t type = ntohs(cp->type);
+        uint16_t major = ntohs(cp->major_version);
+        uint16_t minor = ntohs(cp->minor_version);
+        if (major == 1 && minor == 1 && (type == 21 || type == 22)) {
+            // It's binary, switch handler
+            handle_binary_client(fd);
+            return;
+        }
+    }
+
+    while (1) {
+        // Generate task
+        int code = (rand() % 4) + 1;
+        int a = randomInt();
+        int b = (code == 4) ? ((randomInt() == 0) ? 1 : randomInt()) : randomInt();
+        if (code == 4 && b == 0) b = 1;
+        
+        const char *opstr = "add";
+        if (code == 1) opstr = "add";
+        else if (code == 2) opstr = "sub";
+        else if (code == 3) opstr = "mul";
+        else opstr = "div";
+
+        char task[128];
+        int task_len = snprintf(task, sizeof(task), "%s %d %d\n", opstr, a, b);
+        
+        alarm(5);
+        ssize_t sent = write(fd, task, task_len);
+        alarm(0);
+        if (sent != task_len) break;
+
+        // Wait for answer
+        std::string line;
+        alarm(5);
+        ssize_t r = recv_line(fd, line);
+        alarm(0);
+        if (r <= 0) break;
+
+        // Trim newline
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) 
+            line.pop_back();
+
+        // Calculate expected result
+        int expected = 0;
+        if (code == 1) expected = a + b;
+        else if (code == 2) expected = a - b;
+        else if (code == 3) expected = a * b;
+        else if (code == 4) expected = a / b;
+
+        // Parse and validate answer
+        int answer = 0;
+        if (sscanf(line.c_str(), "%d", &answer) == 1) {
+            if (answer == expected) {
+                alarm(5);
+                write(fd, "OK\n", 3);
+                alarm(0);
+            } else {
+                alarm(5);
+                write(fd, "NOT OK\n", 7);
+                alarm(0);
+            }
+        } else {
+            alarm(5);
+            write(fd, "ERROR PARSE\n", 12);
             alarm(0);
         }
     }
