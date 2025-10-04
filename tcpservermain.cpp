@@ -121,7 +121,7 @@ void handle_text_client(int fd) {
             return;
         }
     }
-    
+
     while (1) {
         // Generate task
         int code = (rand() % 4) + 1;
@@ -181,6 +181,8 @@ void handle_text_client(int fd) {
     }
     close(fd);
 }
+
+void handle_binary_client(int fd);
 
 void handle_binary_client(int fd) {
     conn_fd_for_alarm = fd;
