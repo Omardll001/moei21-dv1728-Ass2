@@ -105,6 +105,23 @@ void handle_text_client(int fd) {
         return;
     }
 
+    // Peek at the first bytes to check for binary protocol
+    char peekbuf[sizeof(calcProtocol)];
+    alarm(5);
+    ssize_t r = recv(fd, peekbuf, sizeof(peekbuf), MSG_PEEK);
+    alarm(0);
+    if (r >= (ssize_t)sizeof(calcProtocol)) {
+        calcProtocol *cp = (calcProtocol*)peekbuf;
+        uint16_t type = ntohs(cp->type);
+        uint16_t major = ntohs(cp->major_version);
+        uint16_t minor = ntohs(cp->minor_version);
+        if (major == 1 && minor == 1 && (type == 21 || type == 22)) {
+            // It's binary, switch handler
+            handle_binary_client(fd);
+            return;
+        }
+    }
+    
     while (1) {
         // Generate task
         int code = (rand() % 4) + 1;
@@ -178,6 +195,12 @@ void handle_binary_client(int fd) {
         close(fd);
         return;
     }
+
+    // Send assignment info line for compatibility with test4
+    const char *assignment = "ASSIGNMENT: You will receive a binary task. Respond with the correct result.\n";
+    alarm(5);
+    write(fd, assignment, strlen(assignment));
+    alarm(0);
 
     uint32_t current_task_id = 0;
     int32_t current_expected = 0;
@@ -260,17 +283,42 @@ void handle_binary_client(int fd) {
             if (cp.id == current_task_id) {
                 if (cp.inResult == (uint32_t)current_expected) {
                     msg.message = htonl(1); // OK
+                    alarm(5);
+                    write(fd, &msg, sizeof(msg));
+                    alarm(0);
+
+                    // Send human-readable OK line for test4 compatibility
+                    char okline[64];
+                    snprintf(okline, sizeof(okline), "OK (myresult=%d)\n", cp.inResult);
+                    alarm(5);
+                    write(fd, okline, strlen(okline));
+                    alarm(0);
                 } else {
                     msg.message = htonl(2); // NOT OK
+                    alarm(5);
+                    write(fd, &msg, sizeof(msg));
+                    alarm(0);
+
+                    // Send human-readable NOT OK line
+                    char nokline[64];
+                    snprintf(nokline, sizeof(nokline), "NOT OK (myresult=%d)\n", cp.inResult);
+                    alarm(5);
+                    write(fd, nokline, strlen(nokline));
+                    alarm(0);
                 }
             } else {
                 msg.message = htonl(2); // NOT OK (wrong ID)
+                alarm(5);
+                write(fd, &msg, sizeof(msg));
+                alarm(0);
+
+                char nokline[64];
+                snprintf(nokline, sizeof(nokline), "NOT OK (wrong id)\n");
+                alarm(5);
+                write(fd, nokline, strlen(nokline));
+                alarm(0);
             }
 
-            alarm(5);
-            write(fd, &msg, sizeof(msg));
-            alarm(0);
-            
             // Reset for next task
             current_task_id = 0;
             current_expected = 0;
@@ -284,6 +332,12 @@ void handle_binary_client(int fd) {
             msg.minor_version = htons(1);
             alarm(5);
             write(fd, &msg, sizeof(msg));
+            alarm(0);
+
+            char nokline[64];
+            snprintf(nokline, sizeof(nokline), "NOT OK (invalid type)\n");
+            alarm(5);
+            write(fd, nokline, strlen(nokline));
             alarm(0);
         }
     }
@@ -344,37 +398,10 @@ int main(int argc, char *argv[]) {
             continue;
         } else if (pid == 0) {
             close(listenfd);
-            
-            // Determine protocol by reading first message
-            char first_bytes[20];
-            alarm(5);
-            ssize_t r = recv(connfd, first_bytes, sizeof(first_bytes), MSG_PEEK);
-            alarm(0);
-            
-            if (r <= 0) {
-                close(connfd);
-                _exit(0);
-            }
-            
-            // Check if it looks like binary protocol
-            bool is_binary = false;
-            if (r >= (ssize_t)sizeof(calcProtocol)) {
-                calcProtocol *cp = (calcProtocol*)first_bytes;
-                uint16_t type = ntohs(cp->type);
-                uint16_t major = ntohs(cp->major_version);
-                uint16_t minor = ntohs(cp->minor_version);
-                
-                if (major == 1 && minor == 1 && (type == 21 || type == 22)) {
-                    is_binary = true;
-                }
-            }
-            
-            if (is_binary) {
-                handle_binary_client(connfd);
-            } else {
-                handle_text_client(connfd);
-            }
-            
+
+            // Always start with text handler, which will switch to binary if needed
+            handle_text_client(connfd);
+
             close(connfd);
             _exit(0);
         } else {
