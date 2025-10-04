@@ -399,11 +399,17 @@ int main(int argc, char *argv[]) {
         } else if (pid == 0) {
             close(listenfd);
 
-            // Peek at the first bytes to detect protocol
+            // Set non-blocking mode
+            int flags = fcntl(connfd, F_GETFL, 0);
+            fcntl(connfd, F_SETFL, flags | O_NONBLOCK);
+
+            // Try to peek at the first bytes
             char peekbuf[sizeof(calcProtocol)];
-            alarm(5);
             ssize_t r = recv(connfd, peekbuf, sizeof(peekbuf), MSG_PEEK);
-            alarm(0);
+
+            // Restore blocking mode
+            fcntl(connfd, F_SETFL, flags);
+
             bool is_binary = false;
             if (r >= (ssize_t)sizeof(calcProtocol)) {
                 calcProtocol *cp = (calcProtocol*)peekbuf;
