@@ -90,6 +90,8 @@ int setup_listener(const char *host, const char *port) {
     return listenfd;
 }
 
+void handle_binary_client(int fd);
+
 void handle_text_client(int fd) {
     conn_fd_for_alarm = fd;
     signal(SIGALRM, alarm_handler);
@@ -182,7 +184,6 @@ void handle_text_client(int fd) {
     close(fd);
 }
 
-void handle_binary_client(int fd);
 
 void handle_binary_client(int fd) {
     conn_fd_for_alarm = fd;
