@@ -16,7 +16,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-#include <string> 
+#include <string>
+#include <algorithm>
 
 #include "protocol.h"
 extern "C" {
@@ -30,7 +31,7 @@ static int conn_fd_for_alarm = -1;
 void alarm_handler(int) {
     if (conn_fd_for_alarm != -1) {
         const char *msg = "ERROR TO\n";
-        send(conn_fd_for_alarm, msg, strlen(msg), 0);
+        write(conn_fd_for_alarm, msg, strlen(msg));
         close(conn_fd_for_alarm);
     }
     _exit(1);
@@ -40,7 +41,7 @@ ssize_t full_read(int fd, void *buf, size_t count) {
     size_t done = 0;
     char *p = (char*)buf;
     while (done < count) {
-        ssize_t r = recv(fd, p + done, count - done, 0);
+        ssize_t r = read(fd, p + done, count - done);
         if (r == 0) return done;
         if (r < 0) {
             if (errno == EINTR) continue;
@@ -55,7 +56,7 @@ ssize_t recv_line(int fd, std::string &out) {
     out.clear();
     char c;
     while (1) {
-        ssize_t r = recv(fd, &c, 1, 0);
+        ssize_t r = read(fd, &c, 1);
         if (r == 0) return 0;
         if (r < 0) {
             if (errno == EINTR) continue;
@@ -96,8 +97,9 @@ void handle_text_client(int fd) {
     // Send TEXT TCP 1.1 greeting immediately
     const char *greeting = "TEXT TCP 1.1\n";
     alarm(5);
-    ssize_t sent = send(fd, greeting, strlen(greeting), 0);
+    ssize_t sent = write(fd, greeting, strlen(greeting));
     alarm(0);
+    
     if (sent != (ssize_t)strlen(greeting)) {
         close(fd);
         return;
@@ -120,7 +122,7 @@ void handle_text_client(int fd) {
         int task_len = snprintf(task, sizeof(task), "%s %d %d\n", opstr, a, b);
         
         alarm(5);
-        ssize_t sent = send(fd, task, task_len, 0);
+        ssize_t sent = write(fd, task, task_len);
         alarm(0);
         if (sent != task_len) break;
 
@@ -147,16 +149,16 @@ void handle_text_client(int fd) {
         if (sscanf(line.c_str(), "%d", &answer) == 1) {
             if (answer == expected) {
                 alarm(5);
-                send(fd, "OK\n", 3, 0);
+                write(fd, "OK\n", 3);
                 alarm(0);
             } else {
                 alarm(5);
-                send(fd, "NOT OK\n", 7, 0);
+                write(fd, "NOT OK\n", 7);
                 alarm(0);
             }
         } else {
             alarm(5);
-            send(fd, "ERROR PARSE\n", 12, 0);
+            write(fd, "ERROR PARSE\n", 12);
             alarm(0);
         }
     }
@@ -170,12 +172,15 @@ void handle_binary_client(int fd) {
     // Send BINARY TCP 1.1 greeting immediately
     const char *greeting = "BINARY TCP 1.1\n";
     alarm(5);
-    ssize_t sent = send(fd, greeting, strlen(greeting), 0);
+    ssize_t sent = write(fd, greeting, strlen(greeting));
     alarm(0);
     if (sent != (ssize_t)strlen(greeting)) {
         close(fd);
         return;
     }
+
+    uint32_t current_task_id = 0;
+    int32_t current_expected = 0;
 
     while (1) {
         calcProtocol cp_net;
@@ -206,7 +211,7 @@ void handle_binary_client(int fd) {
             msg.major_version = htons(1);
             msg.minor_version = htons(1);
             alarm(5);
-            send(fd, &msg, sizeof(msg), 0);
+            write(fd, &msg, sizeof(msg));
             alarm(0);
             continue;
         }
@@ -222,38 +227,53 @@ void handle_binary_client(int fd) {
                 i2 = randomInt();
             }
 
-            int expected = 0;
+            int32_t expected = 0;
             if (code == 1) expected = i1 + i2;
             else if (code == 2) expected = i1 - i2;
             else if (code == 3) expected = i1 * i2;
             else if (code == 4) expected = i1 / i2;
 
+            current_task_id = (uint32_t)(rand() ^ time(NULL));
+            current_expected = expected;
+
             calcProtocol out{};
             out.type = htons(1);
             out.major_version = htons(1);
             out.minor_version = htons(1);
-            out.id = htonl((uint32_t)(rand() ^ time(NULL)));
+            out.id = htonl(current_task_id);
             out.arith = htonl(code);
             out.inValue1 = htonl(i1);
             out.inValue2 = htonl(i2);
             out.inResult = htonl(0);
 
             alarm(5);
-            send(fd, &out, sizeof(out), 0);
+            write(fd, &out, sizeof(out));
             alarm(0);
         } else if (cp.type == 22 && cp.id != 0) {
-            // Client submitting answer - we need to validate this
-            // For simplicity in this version, we'll just acknowledge
+            // Client submitting answer
             calcMessage msg{};
             msg.type = htons(2);
-            msg.message = htonl(1); // OK (simplified)
             msg.protocol = htons(17);
             msg.major_version = htons(1);
             msg.minor_version = htons(1);
 
+            if (cp.id == current_task_id) {
+                if (cp.inResult == (uint32_t)current_expected) {
+                    msg.message = htonl(1); // OK
+                } else {
+                    msg.message = htonl(2); // NOT OK
+                }
+            } else {
+                msg.message = htonl(2); // NOT OK (wrong ID)
+            }
+
             alarm(5);
-            send(fd, &msg, sizeof(msg), 0);
+            write(fd, &msg, sizeof(msg));
             alarm(0);
+            
+            // Reset for next task
+            current_task_id = 0;
+            current_expected = 0;
         } else {
             // Invalid type
             calcMessage msg{};
@@ -263,7 +283,7 @@ void handle_binary_client(int fd) {
             msg.major_version = htons(1);
             msg.minor_version = htons(1);
             alarm(5);
-            send(fd, &msg, sizeof(msg), 0);
+            write(fd, &msg, sizeof(msg));
             alarm(0);
         }
     }
@@ -302,7 +322,7 @@ int main(int argc, char *argv[]) {
         perror("setup_listener"); 
         return 1; 
     }
-    printf("TCP server on %s:%s\n", host, port);
+    fprintf(stderr, "TCP server on %s:%s\n", host, port);
     
     // Ignore SIGPIPE to avoid crashes on broken pipes
     signal(SIGPIPE, SIG_IGN);
@@ -325,10 +345,10 @@ int main(int argc, char *argv[]) {
         } else if (pid == 0) {
             close(listenfd);
             
-            // Read first message to determine protocol
-            char first_byte;
+            // Determine protocol by reading first message
+            char first_bytes[20];
             alarm(5);
-            ssize_t r = recv(connfd, &first_byte, 1, MSG_PEEK);
+            ssize_t r = recv(connfd, first_bytes, sizeof(first_bytes), MSG_PEEK);
             alarm(0);
             
             if (r <= 0) {
@@ -336,9 +356,24 @@ int main(int argc, char *argv[]) {
                 _exit(0);
             }
             
-            // If first byte suggests binary (based on typical binary patterns)
-            // For this test, we'll assume text protocol by default since the test expects TEXT
-            handle_text_client(connfd);
+            // Check if it looks like binary protocol
+            bool is_binary = false;
+            if (r >= (ssize_t)sizeof(calcProtocol)) {
+                calcProtocol *cp = (calcProtocol*)first_bytes;
+                uint16_t type = ntohs(cp->type);
+                uint16_t major = ntohs(cp->major_version);
+                uint16_t minor = ntohs(cp->minor_version);
+                
+                if (major == 1 && minor == 1 && (type == 21 || type == 22)) {
+                    is_binary = true;
+                }
+            }
+            
+            if (is_binary) {
+                handle_binary_client(connfd);
+            } else {
+                handle_text_client(connfd);
+            }
             
             close(connfd);
             _exit(0);

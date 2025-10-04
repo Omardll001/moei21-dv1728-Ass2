@@ -27,10 +27,11 @@ using namespace std;
 struct ClientKey {
     struct sockaddr_storage ss;
     socklen_t len;
+    
     bool operator<(const ClientKey& o) const {
         if (len != o.len) return len < o.len;
         if (ss.ss_family != o.ss.ss_family) return ss.ss_family < o.ss.ss_family;
-        return memcmp(&ss, &o.ss, min(len, o.len)) < 0;
+        return memcmp(&ss, &o.ss, sizeof(ss)) < 0;
     }
 };
 
@@ -122,7 +123,7 @@ int main(int argc, char *argv[]) {
         perror("setup_socket"); 
         return 1; 
     }
-    printf("UDP server on %s:%s\n", host, port);
+    fprintf(stderr, "UDP server on %s:%s\n", host, port);
 
     std::map<ClientKey, ClientState> clients;
 
