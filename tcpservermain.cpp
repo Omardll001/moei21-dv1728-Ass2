@@ -189,7 +189,7 @@ void handle_binary_client(int fd) {
             msg.minor_version = htons(1);
 
             if (cp.id == current_task_id) {
-                if (cp.inResult == (uint32_t)current_expected) {
+                if (cp.inResult == current_expected) {
                     msg.message = htonl(1); // OK
                     alarm(5);
                     write(fd, &msg, sizeof(msg));
