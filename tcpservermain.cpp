@@ -399,8 +399,27 @@ int main(int argc, char *argv[]) {
         } else if (pid == 0) {
             close(listenfd);
 
-            // Always start with text handler, which will switch to binary if needed
-            handle_text_client(connfd);
+            // Peek at the first bytes to detect protocol
+            char peekbuf[sizeof(calcProtocol)];
+            alarm(5);
+            ssize_t r = recv(connfd, peekbuf, sizeof(peekbuf), MSG_PEEK);
+            alarm(0);
+            bool is_binary = false;
+            if (r >= (ssize_t)sizeof(calcProtocol)) {
+                calcProtocol *cp = (calcProtocol*)peekbuf;
+                uint16_t type = ntohs(cp->type);
+                uint16_t major = ntohs(cp->major_version);
+                uint16_t minor = ntohs(cp->minor_version);
+                if (major == 1 && minor == 1 && (type == 21 || type == 22)) {
+                    is_binary = true;
+                }
+            }
+
+            if (is_binary) {
+                handle_binary_client(connfd);
+            } else {
+                handle_text_client(connfd);
+            }
 
             close(connfd);
             _exit(0);
