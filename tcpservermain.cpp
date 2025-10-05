@@ -299,6 +299,12 @@ void handle_text_client(int fd) {
 
         char task[128];
         int task_len = snprintf(task, sizeof(task), "%s %d %d\n", opstr, a, b);
+
+        if (task_len <= 0) {
+        // Assignment generation failed, close connection
+            close(fd);
+            return;
+        }
         
         alarm(5);
         ssize_t sent = write(fd, task, task_len);
