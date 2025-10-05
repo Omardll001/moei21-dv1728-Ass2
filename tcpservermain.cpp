@@ -288,12 +288,9 @@ void handle_text_client(int fd) {
         // Generate task
         int code = (rand() % 4) + 1;
         int a = randomInt();
-        int b = randomInt();
-        if (code == 4) {
-            // Division: never divide by zero
-            while (b == 0) b = randomInt();
-        }
-
+        int b = (code == 4) ? ((randomInt() == 0) ? 1 : randomInt()) : randomInt();
+        if (code == 4 && b == 0) b = 1;
+        
         const char *opstr = "add";
         if (code == 1) opstr = "add";
         else if (code == 2) opstr = "sub";
@@ -302,12 +299,6 @@ void handle_text_client(int fd) {
 
         char task[128];
         int task_len = snprintf(task, sizeof(task), "%s %d %d\n", opstr, a, b);
-
-        if (task_len <= 0 || a == 0 || b == 0) {
-            // Assignment generation failed, close connection
-            close(fd);
-            return;
-        }
         
         alarm(5);
         ssize_t sent = write(fd, task, task_len);
@@ -414,32 +405,7 @@ int main(int argc, char *argv[]) {
         } else if (pid == 0) {
             close(listenfd);
 
-            // Wait up to 100ms for client data
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(connfd, &rfds);
-            struct timeval tv;
-            tv.tv_sec = 0;
-            tv.tv_usec = 100000; // 100ms
-
-            int rv = select(connfd + 1, &rfds, NULL, NULL, &tv);
-
-            bool is_binary = false;
-            if (rv > 0 && FD_ISSET(connfd, &rfds)) {
-                char peekbuf[sizeof(calcProtocol)];
-                ssize_t r = recv(connfd, peekbuf, sizeof(peekbuf), MSG_PEEK);
-                if (r >= (ssize_t)sizeof(calcProtocol)) {
-                    calcProtocol *cp = (calcProtocol*)peekbuf;
-                    uint16_t type = ntohs(cp->type);
-                    uint16_t major = ntohs(cp->major_version);
-                    uint16_t minor = ntohs(cp->minor_version);
-                    if (major == 1 && minor == 1 && (type == 21 || type == 22)) {
-                        is_binary = true;
-                    }
-                }
-            }
-
-            if (is_binary) {
+            if (force_binary) {
                 handle_binary_client(connfd);
             } else {
                 handle_text_client(connfd);
