@@ -256,8 +256,8 @@ void handle_text_client(int fd) {
     conn_fd_for_alarm = fd;
     signal(SIGALRM, alarm_handler);
 
-    // Send TEXT TCP 1.0 greeting immediately
-    const char *greeting = "TEXT TCP 1.0\n\n";
+    // Send TEXT TCP 1.1 greeting immediately
+    const char *greeting = "TEXT TCP 1.1\n";
     alarm(5);
     ssize_t sent = write(fd, greeting, strlen(greeting));
     alarm(0);
@@ -414,10 +414,6 @@ int main(int argc, char *argv[]) {
         } else if (pid == 0) {
             close(listenfd);
 
-            // Set non-blocking mode
-            int flags = fcntl(connfd, F_GETFL, 0);
-            fcntl(connfd, F_SETFL, flags | O_NONBLOCK);
-
             // Wait up to 100ms for client data
             fd_set rfds;
             FD_ZERO(&rfds);
@@ -442,9 +438,6 @@ int main(int argc, char *argv[]) {
                     }
                 }
             }
-
-            // Restore blocking mode
-            fcntl(connfd, F_SETFL, flags);
 
             if (is_binary) {
                 handle_binary_client(connfd);
