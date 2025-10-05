@@ -352,9 +352,17 @@ int main(int argc, char *argv[]) {
     strncpy(host, input, hostlen); 
     host[hostlen] = '\0';
 
-    // Parse port after colon
-    strncpy(port, sep + 1, sizeof(port) - 1);
-    port[sizeof(port) - 1] = '\0';
+    // Parse port after colon, digits only
+    char *port_start = sep + 1;
+    char *port_end = port_start;
+    while (*port_end && isdigit(*port_end)) port_end++;
+    size_t portlen = port_end - port_start;
+    if (portlen == 0 || portlen >= sizeof(port)) {
+        fprintf(stderr, "Invalid port\n");
+        return 1;
+    }
+    strncpy(port, port_start, portlen);
+    port[portlen] = '\0';
 
     int listenfd = setup_listener(host, port);
     if (listenfd < 0) { 
