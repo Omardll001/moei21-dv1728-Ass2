@@ -256,8 +256,8 @@ void handle_text_client(int fd) {
     conn_fd_for_alarm = fd;
     signal(SIGALRM, alarm_handler);
 
-    // Send TEXT TCP 1.1 greeting immediately
-    const char *greeting = "TEXT TCP 1.1\n";
+    // Send TEXT TCP 1.0 greeting immediately
+    const char *greeting = "TEXT TCP 1.0\n\n";
     alarm(5);
     ssize_t sent = write(fd, greeting, strlen(greeting));
     alarm(0);
