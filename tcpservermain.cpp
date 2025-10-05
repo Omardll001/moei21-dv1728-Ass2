@@ -405,7 +405,39 @@ int main(int argc, char *argv[]) {
         } else if (pid == 0) {
             close(listenfd);
 
-            if (force_binary) {
+            // Set non-blocking mode
+            int flags = fcntl(connfd, F_GETFL, 0);
+            fcntl(connfd, F_SETFL, flags | O_NONBLOCK);
+
+            // Wait up to 100ms for client data
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(connfd, &rfds);
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000; // 100ms
+
+            int rv = select(connfd + 1, &rfds, NULL, NULL, &tv);
+
+            bool is_binary = false;
+            if (rv > 0 && FD_ISSET(connfd, &rfds)) {
+                char peekbuf[sizeof(calcProtocol)];
+                ssize_t r = recv(connfd, peekbuf, sizeof(peekbuf), MSG_PEEK);
+                if (r >= (ssize_t)sizeof(calcProtocol)) {
+                    calcProtocol *cp = (calcProtocol*)peekbuf;
+                    uint16_t type = ntohs(cp->type);
+                    uint16_t major = ntohs(cp->major_version);
+                    uint16_t minor = ntohs(cp->minor_version);
+                    if (major == 1 && minor == 1 && (type == 21 || type == 22)) {
+                        is_binary = true;
+                    }
+                }
+            }
+
+            // Restore blocking mode
+            fcntl(connfd, F_SETFL, flags);
+
+            if (is_binary) {
                 handle_binary_client(connfd);
             } else {
                 handle_text_client(connfd);
