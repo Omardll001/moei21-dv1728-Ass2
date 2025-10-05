@@ -361,7 +361,6 @@ int main(int argc, char *argv[]) {
     }
     char host[256]; 
     char port[64];
-    char path[64] = "";
     size_t hostlen = sep - input;
     if (hostlen >= sizeof(host)) { 
         fprintf(stderr, "hostname too long\n"); 
@@ -370,6 +369,9 @@ int main(int argc, char *argv[]) {
     strncpy(host, input, hostlen); 
     host[hostlen] = '\0';
 
+    // Parse port after colon
+    strncpy(port, sep + 1, sizeof(port) - 1);
+    port[sizeof(port) - 1] = '\0';
 
     int listenfd = setup_listener(host, port);
     if (listenfd < 0) { 
