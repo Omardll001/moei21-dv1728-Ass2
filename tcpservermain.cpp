@@ -371,18 +371,6 @@ int main(int argc, char *argv[]) {
     host[hostlen] = '\0';
 
 
-    // Check for /binary path
-    char *pathsep = strchr(sep + 1, '/');
-    if (pathsep) {
-        strncpy(port, sep + 1, pathsep - (sep + 1));
-        port[pathsep - (sep + 1)] = '\0';
-        strncpy(path, pathsep, sizeof(path) - 1);
-        path[sizeof(path) - 1] = '\0';
-    } else {
-        strncpy(port, sep + 1, sizeof(port) - 1); 
-        port[sizeof(port) - 1] = '\0';
-    }
-
     int listenfd = setup_listener(host, port);
     if (listenfd < 0) { 
         perror("setup_listener"); 
@@ -392,16 +380,6 @@ int main(int argc, char *argv[]) {
 
     // Ignore SIGPIPE to avoid crashes on broken pipes
     signal(SIGPIPE, SIG_IGN);
-
-    // Decide protocol mode
-    bool force_binary = false;
-    if (argc >= 3 && strcmp(argv[2], "binary") == 0) {
-        force_binary = true;
-    }
-    // If path is /binary, force binary mode
-    if (strcmp(path, "/binary") == 0) {
-        force_binary = true;
-    }
 
     while (1) {
         struct sockaddr_storage cliaddr;
