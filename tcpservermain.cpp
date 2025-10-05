@@ -20,7 +20,7 @@
 #include <algorithm>
 #include <math.h> 
 #include <poll.h>
-#include <vector>
+
 
 #include "protocol.h"
 extern "C" {
@@ -416,90 +416,93 @@ int main(int argc, char *argv[]) {
             close(connfd);
             continue;
         } else if (pid == 0) {
+            // child
             close(listenfd);
 
-            int flags = fcntl(connfd, F_GETFL, 0);
-            if (flags == -1) flags = 0;
-            fcntl(connfd, F_SETFL, flags | O_NONBLOCK); // do a non-blocking peek
-
+            // Do an immediate poll(…,0). If no data is immediately available,
+            // assume TEXT and call text handler (which will send the greeting).
             const size_t MAX_PEEK = std::max(sizeof(calcProtocol), (size_t)32);
-            std::vector<char> peekbuf(MAX_PEEK);
+            char peekbuf[MAX_PEEK];
 
-            // quick poll (zero timeout) to see if there is any data immediately available
             struct pollfd pfd;
             pfd.fd = connfd;
             pfd.events = POLLIN;
             pfd.revents = 0;
 
-            int pol = poll(&pfd, 1, 0); // 0 ms -> instant check
-            bool is_binary = false;
-
-            if (pol <= 0) {
-                // No data ready immediately -> assume TEXT and proceed (send greeting immediately in handle_text_client)
-                fcntl(connfd, F_SETFL, flags); // restore original flags
+            int pol = poll(&pfd, 1, 0); // immediate check
+            if (pol < 0) {
+                // poll error
+                perror("poll");
+                close(connfd);
+                _exit(1);
+            }
+            if (pol == 0) {
+                // no data right now -> assume TEXT, send greeting immediately in handler
+                fprintf(stderr, "protocol-detect: no data on connect -> assuming TEXT\n");
                 handle_text_client(connfd);
-                // handle_text_client will close and _exit, but just in case:
+                // handler should close fd and exit; ensure we exit child
+                _exit(0);
+            }
+
+            // pol > 0: ensure readable event
+            if (!(pfd.revents & POLLIN)) {
+                // unexpected event (HUP/ERR) — close
+                fprintf(stderr, "protocol-detect: unexpected poll revents=0x%x\n", pfd.revents);
+                close(connfd);
+                _exit(1);
+            }
+
+            // Data available now: peek and decide
+            ssize_t r = recv(connfd, peekbuf, MAX_PEEK, MSG_PEEK);
+            if (r <= 0) {
+                // client closed or error
                 close(connfd);
                 _exit(0);
-            } else {
-                // Data is available now; do a safe peek (try to get up to MAX_PEEK)
-                ssize_t r = recv(connfd, peekbuf.data(), MAX_PEEK, MSG_PEEK);
-                if (r <= 0) {
-                    // connection closed or error — restore flags and exit child
-                    fcntl(connfd, F_SETFL, flags);
-                    close(connfd);
-                    _exit(0);
-                }
+            }
+            size_t got = (size_t) r;
 
-                size_t got = (size_t) r;
+            // 1) If peek contains newline within printable ASCII -> TEXT
+            bool looks_text = false;
+            for (size_t i = 0; i < got; ++i) {
+                unsigned char c = static_cast<unsigned char>(peekbuf[i]);
+                if (c == '\n') { looks_text = true; break; }
+                // allow basic printable ASCII and whitespace (tab, CR)
+                if (c < 0x09 || c > 0x7E) { looks_text = false; break; }
+            }
+            if (looks_text) {
+                fprintf(stderr, "protocol-detect: peek looks like TEXT\n");
+                handle_text_client(connfd);
+                _exit(0);
+            }
 
-                // 1) If the peeked data contains a newline within printable ascii -> treat as TEXT
-                bool looks_text = false;
-                for (size_t i = 0; i < got; ++i) {
-                    unsigned char c = static_cast<unsigned char>(peekbuf[i]);
-                    if (c == '\n') { looks_text = true; break; }
-                    // allow printable ASCII and whitespace (tab, CR)
-                    if (c < 0x09 || c > 0x7E) { looks_text = false; break; }
-                }
+            // 2) If we have a full calcProtocol header, validate it safely
+            bool is_binary = false;
+            if (got >= sizeof(calcProtocol)) {
+                calcProtocol tmp;
+                memcpy(&tmp, peekbuf, sizeof(tmp)); // safe copy to avoid alignment/aliasing UB
+                uint16_t type = ntohs(tmp.type);
+                uint16_t maj  = ntohs(tmp.major_version);
+                uint16_t min  = ntohs(tmp.minor_version);
 
-                if (looks_text) {
-                    fcntl(connfd, F_SETFL, flags);
-                    handle_text_client(connfd);
-                    close(connfd);
-                    _exit(0);
-                }
-
-                // 2) If we have enough bytes for a calcProtocol header, validate it safely
-                if (got >= sizeof(calcProtocol)) {
-                    calcProtocol tmp;
-                    memcpy(&tmp, peekbuf.data(), sizeof(tmp)); // safe copy to avoid alignment/aliasing UB
-                    uint16_t type = ntohs(tmp.type);
-                    uint16_t maj  = ntohs(tmp.major_version);
-                    uint16_t min  = ntohs(tmp.minor_version);
-
-                    if ((type == 21 || type == 22) && maj == 1 && min == 1) {
-                        is_binary = true;
-                    }
-                }
-
-                // 3) If undecided (not enough bytes for binary header and no newline), fall back to TEXT
-                // (we choose to prefer immediate greeting over waiting longer)
-                if (!is_binary) {
-                    fcntl(connfd, F_SETFL, flags);
-                    handle_text_client(connfd);
-                    close(connfd);
-                    _exit(0);
-                }
-
-                // restore flags before handing to binary handler
-                fcntl(connfd, F_SETFL, flags);
-                if (is_binary) {
-                    handle_binary_client(connfd);
-                    close(connfd);
-                    _exit(0);
+                if ((type == 21 || type == 22) && maj == 1 && min == 1) {
+                    is_binary = true;
                 }
             }
+
+            // 3) Undecided or partial -> default to TEXT (do not delay greeting)
+            if (!is_binary) {
+                fprintf(stderr, "protocol-detect: undecided (partial/unknown) -> defaulting to TEXT\n");
+                handle_text_client(connfd);
+                _exit(0);
+            }
+
+            // 4) Validated binary
+            fprintf(stderr, "protocol-detect: validated BINARY header\n");
+            handle_binary_client(connfd);
+            _exit(0);
+
         } else {
+            // parent
             close(connfd);
             while (waitpid(-1, NULL, WNOHANG) > 0) {}
         }
