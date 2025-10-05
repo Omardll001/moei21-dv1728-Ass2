@@ -288,9 +288,12 @@ void handle_text_client(int fd) {
         // Generate task
         int code = (rand() % 4) + 1;
         int a = randomInt();
-        int b = (code == 4) ? ((randomInt() == 0) ? 1 : randomInt()) : randomInt();
-        if (code == 4 && b == 0) b = 1;
-        
+        int b = randomInt();
+        if (code == 4) {
+            // Division: never divide by zero
+            while (b == 0) b = randomInt();
+        }
+
         const char *opstr = "add";
         if (code == 1) opstr = "add";
         else if (code == 2) opstr = "sub";
@@ -300,8 +303,8 @@ void handle_text_client(int fd) {
         char task[128];
         int task_len = snprintf(task, sizeof(task), "%s %d %d\n", opstr, a, b);
 
-        if (task_len <= 0) {
-        // Assignment generation failed, close connection
+        if (task_len <= 0 || a == 0 || b == 0) {
+            // Assignment generation failed, close connection
             close(fd);
             return;
         }
