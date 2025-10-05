@@ -267,23 +267,6 @@ void handle_text_client(int fd) {
         return;
     }
 
-    // Peek at the first bytes to check for binary protocol
-    char peekbuf[sizeof(calcProtocol)];
-    alarm(5);
-    ssize_t r = recv(fd, peekbuf, sizeof(peekbuf), MSG_PEEK);
-    alarm(0);
-    if (r >= (ssize_t)sizeof(calcProtocol)) {
-        calcProtocol *cp = (calcProtocol*)peekbuf;
-        uint16_t type = ntohs(cp->type);
-        uint16_t major = ntohs(cp->major_version);
-        uint16_t minor = ntohs(cp->minor_version);
-        if (major == 1 && minor == 1 && (type == 21 || type == 22)) {
-            // It's binary, switch handler
-            handle_binary_client(fd);
-            return;
-        }
-    }
-
     while (1) {
         // Generate task
         int code = (rand() % 4) + 1;
