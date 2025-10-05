@@ -256,7 +256,16 @@ void handle_text_client(int fd) {
     conn_fd_for_alarm = fd;
     signal(SIGALRM, alarm_handler);
 
+    // Send TEXT TCP 1.1 greeting immediately
+    const char *greeting = "TEXT TCP 1.1\n";
+    alarm(5);
+    ssize_t sent = write(fd, greeting, strlen(greeting));
+    alarm(0);
     
+    if (sent != (ssize_t)strlen(greeting)) {
+        close(fd);
+        return;
+    }
 
     // Peek at the first bytes to check for binary protocol
     char peekbuf[sizeof(calcProtocol)];
@@ -273,17 +282,6 @@ void handle_text_client(int fd) {
             handle_binary_client(fd);
             return;
         }
-    }
-
-    // Send TEXT TCP 1.1 greeting immediately
-    const char *greeting = "TEXT TCP 1.1\n";
-    alarm(5);
-    ssize_t sent = write(fd, greeting, strlen(greeting));
-    alarm(0);
-    
-    if (sent != (ssize_t)strlen(greeting)) {
-        close(fd);
-        return;
     }
 
     while (1) {
@@ -363,6 +361,7 @@ int main(int argc, char *argv[]) {
     }
     char host[256]; 
     char port[64];
+    char path[64] = "";
     size_t hostlen = sep - input;
     if (hostlen >= sizeof(host)) { 
         fprintf(stderr, "hostname too long\n"); 
@@ -370,22 +369,37 @@ int main(int argc, char *argv[]) {
     }
     strncpy(host, input, hostlen); 
     host[hostlen] = '\0';
-    strncpy(port, sep + 1, sizeof(port) - 1); 
-    port[sizeof(port) - 1] = '\0';
-    
+
+
+    // Check for /binary path
+    char *pathsep = strchr(sep + 1, '/');
+    if (pathsep) {
+        strncpy(port, sep + 1, pathsep - (sep + 1));
+        port[pathsep - (sep + 1)] = '\0';
+        strncpy(path, pathsep, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+    } else {
+        strncpy(port, sep + 1, sizeof(port) - 1); 
+        port[sizeof(port) - 1] = '\0';
+    }
+
     int listenfd = setup_listener(host, port);
     if (listenfd < 0) { 
         perror("setup_listener"); 
         return 1; 
     }
     fprintf(stderr, "TCP server on %s:%s\n", host, port);
-    
+
     // Ignore SIGPIPE to avoid crashes on broken pipes
     signal(SIGPIPE, SIG_IGN);
 
     // Decide protocol mode
     bool force_binary = false;
     if (argc >= 3 && strcmp(argv[2], "binary") == 0) {
+        force_binary = true;
+    }
+    // If path is /binary, force binary mode
+    if (strcmp(path, "/binary") == 0) {
         force_binary = true;
     }
 
