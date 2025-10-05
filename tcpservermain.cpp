@@ -308,9 +308,14 @@ void handle_text_client(int fd) {
         else if (code == 4) expected = a / b;
 
         // Parse and validate answer
+                // Trim whitespace
+        line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
+
+        bool ok = false;
         int answer_int = 0;
         double answer_double = 0.0;
-        bool ok = false;
+
+        // Try integer first
         if (sscanf(line.c_str(), "%d", &answer_int) == 1) {
             if (answer_int == expected) ok = true;
         } else if (sscanf(line.c_str(), "%lf", &answer_double) == 1) {
