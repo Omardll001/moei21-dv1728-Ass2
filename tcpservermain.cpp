@@ -329,7 +329,7 @@ void handle_text_client(int fd) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s host:port [text|binary]\n", argv[0]);
+        fprintf(stderr, "Usage: %s host:port\n", argv[0]);
         exit(EXIT_FAILURE);
     }
     initCalcLib();
@@ -371,7 +371,6 @@ int main(int argc, char *argv[]) {
     }
     fprintf(stderr, "TCP server on %s:%s\n", host, port);
 
-    // Ignore SIGPIPE to avoid crashes on broken pipes
     signal(SIGPIPE, SIG_IGN);
 
     while (1) {
@@ -408,6 +407,10 @@ int main(int argc, char *argv[]) {
                     is_binary = true;
                 }
             }
+            // If nothing received, assume text
+            if (r == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                is_binary = false;
+            }
 
             // Restore blocking mode
             fcntl(connfd, F_SETFL, flags);
@@ -422,11 +425,9 @@ int main(int argc, char *argv[]) {
             _exit(0);
         } else {
             close(connfd);
-            // Reap zombie processes
             while (waitpid(-1, NULL, WNOHANG) > 0) {}
         }
     }
-    
     close(listenfd);
     return 0;
 }
