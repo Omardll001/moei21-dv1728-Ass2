@@ -256,16 +256,7 @@ void handle_text_client(int fd) {
     conn_fd_for_alarm = fd;
     signal(SIGALRM, alarm_handler);
 
-    // Send TEXT TCP 1.1 greeting immediately
-    const char *greeting = "TEXT TCP 1.1\n";
-    alarm(5);
-    ssize_t sent = write(fd, greeting, strlen(greeting));
-    alarm(0);
     
-    if (sent != (ssize_t)strlen(greeting)) {
-        close(fd);
-        return;
-    }
 
     // Peek at the first bytes to check for binary protocol
     char peekbuf[sizeof(calcProtocol)];
@@ -282,6 +273,17 @@ void handle_text_client(int fd) {
             handle_binary_client(fd);
             return;
         }
+    }
+
+    // Send TEXT TCP 1.1 greeting immediately
+    const char *greeting = "TEXT TCP 1.1\n";
+    alarm(5);
+    ssize_t sent = write(fd, greeting, strlen(greeting));
+    alarm(0);
+    
+    if (sent != (ssize_t)strlen(greeting)) {
+        close(fd);
+        return;
     }
 
     while (1) {
