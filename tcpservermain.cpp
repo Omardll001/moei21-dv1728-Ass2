@@ -421,8 +421,11 @@ int main(int argc, char *argv[]) {
         } else if (pid == 0) {
             close(listenfd);
 
-            // Always start in text mode, auto-switch to binary if needed
-            handle_text_client(connfd);
+            if (force_binary) {
+                handle_binary_client(connfd);
+            } else {
+                handle_text_client(connfd);
+            }
 
             close(connfd);
             _exit(0);
@@ -431,6 +434,7 @@ int main(int argc, char *argv[]) {
             // Reap zombie processes
             while (waitpid(-1, NULL, WNOHANG) > 0) {}
         }
+    }
     
     close(listenfd);
     return 0;
