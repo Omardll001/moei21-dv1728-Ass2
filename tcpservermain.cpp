@@ -18,6 +18,7 @@
 #include <time.h>
 #include <string>
 #include <algorithm>
+#include <math.h> 
 
 #include "protocol.h"
 extern "C" {
@@ -307,20 +308,22 @@ void handle_text_client(int fd) {
         else if (code == 4) expected = a / b;
 
         // Parse and validate answer
-        int answer = 0;
-        if (sscanf(line.c_str(), "%d", &answer) == 1) {
-            if (answer == expected) {
-                alarm(5);
-                write(fd, "OK\n", 3);
-                alarm(0);
-            } else {
-                alarm(5);
-                write(fd, "NOT OK\n", 7);
-                alarm(0);
-            }
+        int answer_int = 0;
+        double answer_double = 0.0;
+        bool ok = false;
+        if (sscanf(line.c_str(), "%d", &answer_int) == 1) {
+            if (answer_int == expected) ok = true;
+        } else if (sscanf(line.c_str(), "%lf", &answer_double) == 1) {
+            if (fabs(answer_double - expected) < 0.0001) ok = true;
+        }
+
+        if (ok) {
+            alarm(5);
+            write(fd, "OK\n", 3);
+            alarm(0);
         } else {
             alarm(5);
-            write(fd, "ERROR PARSE\n", 12);
+            write(fd, "NOT OK\n", 7);
             alarm(0);
         }
     }
