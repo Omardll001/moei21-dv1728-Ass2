@@ -392,13 +392,14 @@ int main(int argc, char *argv[]) {
         } else if (pid == 0) {
             close(listenfd);
 
-            // Peek at the first bytes to auto-detect protocol
+            // Set non-blocking to peek without waiting
+            int flags = fcntl(connfd, F_GETFL, 0);
+            fcntl(connfd, F_SETFL, flags | O_NONBLOCK);
+
             char peekbuf[sizeof(calcProtocol)];
-            alarm(5);
             ssize_t r = recv(connfd, peekbuf, sizeof(peekbuf), MSG_PEEK);
-            alarm(0);
             bool is_binary = false;
-            if (r >= (ssize_t)sizeof(calcProtocol)) {
+            if (r == (ssize_t)sizeof(calcProtocol)) {
                 calcProtocol *cp = (calcProtocol*)peekbuf;
                 uint16_t type = ntohs(cp->type);
                 uint16_t major = ntohs(cp->major_version);
@@ -407,6 +408,9 @@ int main(int argc, char *argv[]) {
                     is_binary = true;
                 }
             }
+
+            // Restore blocking mode
+            fcntl(connfd, F_SETFL, flags);
 
             if (is_binary) {
                 handle_binary_client(connfd);
