@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <math.h> 
 #include <poll.h>
+#include <vector>
 
 #include "protocol.h"
 extern "C" {
@@ -417,101 +418,87 @@ int main(int argc, char *argv[]) {
         } else if (pid == 0) {
             close(listenfd);
 
-            // Set non-blocking to peek without waiting
             int flags = fcntl(connfd, F_GETFL, 0);
-            fcntl(connfd, F_SETFL, flags | O_NONBLOCK);
+            if (flags == -1) flags = 0;
+            fcntl(connfd, F_SETFL, flags | O_NONBLOCK); // do a non-blocking peek
 
-            // maximum bytes to peek (enough for text greeting or full calcProtocol)
             const size_t MAX_PEEK = std::max(sizeof(calcProtocol), (size_t)32);
-            char peekbuf[MAX_PEEK];
-            size_t total_peeked = 0;
-            bool is_binary = false;
+            std::vector<char> peekbuf(MAX_PEEK);
 
-            // wait for data with poll() (5s)
+            // quick poll (zero timeout) to see if there is any data immediately available
             struct pollfd pfd;
             pfd.fd = connfd;
             pfd.events = POLLIN;
-            int pollret = poll(&pfd, 1, 5000); // milliseconds
-            if (pollret <= 0) {
-                // timeout or error: treat as timeout (parent/child should handle per-assignment)
-                // we choose to close and exit child
-                const char *err = "ERROR TO\n";
-                write(connfd, err, strlen(err));
-                close(connfd);
-                _exit(1);
-            }
+            pfd.revents = 0;
 
-            // now data is available; peek up to MAX_PEEK bytes (blocking recv with MSG_PEEK)
-            ssize_t r = recv(connfd, peekbuf, MAX_PEEK, MSG_PEEK);
-            if (r <= 0) {
-                // connection closed or error
+            int pol = poll(&pfd, 1, 0); // 0 ms -> instant check
+            bool is_binary = false;
+
+            if (pol <= 0) {
+                // No data ready immediately -> assume TEXT and proceed (send greeting immediately in handle_text_client)
+                fcntl(connfd, F_SETFL, flags); // restore original flags
+                handle_text_client(connfd);
+                // handle_text_client will close and _exit, but just in case:
                 close(connfd);
                 _exit(0);
-            }
-            total_peeked = (size_t)r;
-
-            // 1) Check if it looks like a TEXT greeting: starts with ASCII letters and has newline
-            bool looks_text = false;
-            if (total_peeked > 0) {
-                bool all_print = true;
-                size_t newline_pos = SIZE_MAX;
-                for (size_t i = 0; i < total_peeked; ++i) {
-                    unsigned char c = peekbuf[i];
-                    if (c == '\n') { newline_pos = i; break; }
-                    if (c < 0x09 || c > 0x7E) { all_print = false; break; } // allow basic whitespace+print
+            } else {
+                // Data is available now; do a safe peek (try to get up to MAX_PEEK)
+                ssize_t r = recv(connfd, peekbuf.data(), MAX_PEEK, MSG_PEEK);
+                if (r <= 0) {
+                    // connection closed or error — restore flags and exit child
+                    fcntl(connfd, F_SETFL, flags);
+                    close(connfd);
+                    _exit(0);
                 }
-                // If we found a newline and the preceding bytes are printable ASCII, treat as text
-                if (newline_pos != SIZE_MAX && all_print) looks_text = true;
-            }
 
-            // 2) If not text, check if we have at least sizeof(calcProtocol) bytes and validate fields
-            bool looks_binary = false;
-            if (!looks_text && total_peeked >= sizeof(calcProtocol)) {
-                calcProtocol tmp;
-                memcpy(&tmp, peekbuf, sizeof(tmp)); // safe copy to avoid alignment/alias problems
+                size_t got = (size_t) r;
 
-                uint16_t type = ntohs(tmp.type);
-                uint16_t maj  = ntohs(tmp.major_version);
-                uint16_t min  = ntohs(tmp.minor_version);
-
-                if ((type == 21 || type == 22) && maj == 1 && min == 1) {
-                    looks_binary = true;
+                // 1) If the peeked data contains a newline within printable ascii -> treat as TEXT
+                bool looks_text = false;
+                for (size_t i = 0; i < got; ++i) {
+                    unsigned char c = static_cast<unsigned char>(peekbuf[i]);
+                    if (c == '\n') { looks_text = true; break; }
+                    // allow printable ASCII and whitespace (tab, CR)
+                    if (c < 0x09 || c > 0x7E) { looks_text = false; break; }
                 }
-            }
 
-            // 3) If undecided but we have less than sizeof(calcProtocol), try to read more (loop briefly until timeout)
-            if (!looks_text && !looks_binary && total_peeked < sizeof(calcProtocol)) {
-                // try to accumulate until we either see a newline (text) or have enough bytes for binary,
-                // but still respect the same 5s limit. Simple approach: single blocking recv(MSG_PEEK) again with poll.
-                // (You can loop a few times if you want; for brevity we do one more poll+peek)
-                pollret = poll(&pfd, 1, 2000); // give a little more time, adjust as you like
-                if (pollret > 0) {
-                    r = recv(connfd, peekbuf, MAX_PEEK, MSG_PEEK);
-                    if (r > 0) {
-                        total_peeked = (size_t)r;
-                        // repeat checks above (omitted here for brevity)...
-                        // (copy the checks for looks_text and looks_binary)
-                        // [you should re-run the text and binary checks here]
+                if (looks_text) {
+                    fcntl(connfd, F_SETFL, flags);
+                    handle_text_client(connfd);
+                    close(connfd);
+                    _exit(0);
+                }
+
+                // 2) If we have enough bytes for a calcProtocol header, validate it safely
+                if (got >= sizeof(calcProtocol)) {
+                    calcProtocol tmp;
+                    memcpy(&tmp, peekbuf.data(), sizeof(tmp)); // safe copy to avoid alignment/aliasing UB
+                    uint16_t type = ntohs(tmp.type);
+                    uint16_t maj  = ntohs(tmp.major_version);
+                    uint16_t min  = ntohs(tmp.minor_version);
+
+                    if ((type == 21 || type == 22) && maj == 1 && min == 1) {
+                        is_binary = true;
                     }
                 }
+
+                // 3) If undecided (not enough bytes for binary header and no newline), fall back to TEXT
+                // (we choose to prefer immediate greeting over waiting longer)
+                if (!is_binary) {
+                    fcntl(connfd, F_SETFL, flags);
+                    handle_text_client(connfd);
+                    close(connfd);
+                    _exit(0);
+                }
+
+                // restore flags before handing to binary handler
+                fcntl(connfd, F_SETFL, flags);
+                if (is_binary) {
+                    handle_binary_client(connfd);
+                    close(connfd);
+                    _exit(0);
+                }
             }
-
-            // Final decision (if neither, default to TEXT OR error)
-            // Prefer binary only if validated; otherwise treat as text
-            if (looks_binary) is_binary = true;
-            else is_binary = false;
-
-            // Restore blocking mode
-            fcntl(connfd, F_SETFL, flags);
-
-            if (is_binary) {
-                handle_binary_client(connfd);
-            } else {
-                handle_text_client(connfd);
-            }
-
-            close(connfd);
-            _exit(0);
         } else {
             close(connfd);
             while (waitpid(-1, NULL, WNOHANG) > 0) {}
