@@ -420,17 +420,23 @@ int main(int argc, char *argv[]) {
             int flags = fcntl(connfd, F_GETFL, 0);
             fcntl(connfd, F_SETFL, flags | O_NONBLOCK);
 
-            char peekbuf[sizeof(calcProtocol)];
+                        char peekbuf[sizeof(calcProtocol)];
             ssize_t r = recv(connfd, peekbuf, sizeof(peekbuf), MSG_PEEK);
             bool is_binary = false;
-            if (r >= 4) {
+            if (r >= 8) {
+                uint16_t type = ntohs(*(uint16_t*)peekbuf);
+                uint16_t major = ntohs(*(uint16_t*)(peekbuf + 2));
+                uint16_t minor = ntohs(*(uint16_t*)(peekbuf + 4));
+                if ((type == 21 || type == 22) && major == 1 && minor == 1) {
+                    is_binary = true;
+                }
+            } else if (r >= 4) {
                 uint16_t type = ntohs(*(uint16_t*)peekbuf);
                 uint16_t major = ntohs(*(uint16_t*)(peekbuf + 2));
                 if ((type == 21 || type == 22) && major == 1) {
                     is_binary = true;
                 }
             }
-            
             // If nothing received, assume text
             if (r == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 is_binary = false;
