@@ -262,7 +262,7 @@ void handle_text_client(int fd) {
     alarm(5);
     ssize_t sent = write(fd, greeting, strlen(greeting));
     alarm(0);
-    
+
     if (sent != (ssize_t)strlen(greeting)) {
         close(fd);
         return;
@@ -274,7 +274,7 @@ void handle_text_client(int fd) {
         int a = randomInt();
         int b = (code == 4) ? ((randomInt() == 0) ? 1 : randomInt()) : randomInt();
         if (code == 4 && b == 0) b = 1;
-        
+
         const char *opstr = "add";
         if (code == 1) opstr = "add";
         else if (code == 2) opstr = "sub";
@@ -283,7 +283,7 @@ void handle_text_client(int fd) {
 
         char task[128];
         int task_len = snprintf(task, sizeof(task), "%s %d %d\n", opstr, a, b);
-        
+
         alarm(5);
         ssize_t sent = write(fd, task, task_len);
         alarm(0);
@@ -294,10 +294,15 @@ void handle_text_client(int fd) {
         alarm(5);
         ssize_t r = recv_line(fd, line);
         alarm(0);
-        if (r <= 0) break;
+        if (r <= 0) {
+            // Timeout or disconnect
+            const char *err = "ERROR TO\n";
+            write(fd, err, strlen(err));
+            break;
+        }
 
         // Trim newline
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) 
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
             line.pop_back();
 
         // Calculate expected result
@@ -308,7 +313,6 @@ void handle_text_client(int fd) {
         else if (code == 4) expected = a / b;
 
         // Parse and validate answer
-                // Trim whitespace
         line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
 
         bool ok = false;
