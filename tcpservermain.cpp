@@ -423,15 +423,14 @@ int main(int argc, char *argv[]) {
             char peekbuf[sizeof(calcProtocol)];
             ssize_t r = recv(connfd, peekbuf, sizeof(peekbuf), MSG_PEEK);
             bool is_binary = false;
-            if (r == (ssize_t)sizeof(calcProtocol)) {
-                calcProtocol *cp = (calcProtocol*)peekbuf;
-                uint16_t type = ntohs(cp->type);
-                uint16_t major = ntohs(cp->major_version);
-                uint16_t minor = ntohs(cp->minor_version);
-                if (major == 1 && minor == 1 && (type == 21 || type == 22)) {
+            if (r >= 4) {
+                uint16_t type = ntohs(*(uint16_t*)peekbuf);
+                uint16_t major = ntohs(*(uint16_t*)(peekbuf + 2));
+                if ((type == 21 || type == 22) && major == 1) {
                     is_binary = true;
                 }
             }
+            
             // If nothing received, assume text
             if (r == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 is_binary = false;
