@@ -268,6 +268,19 @@ void handle_text_client(int fd) {
         return;
     }
 
+    // Wait for client greeting/ack
+    std::string client_greeting;
+    alarm(5);
+    ssize_t r = recv_line(fd, client_greeting);
+    alarm(0);
+    if (r <= 0) {
+        // Timeout or disconnect
+        const char *err = "ERROR TO\n";
+        write(fd, err, strlen(err));
+        close(fd);
+        return;
+    }
+
     while (1) {
         // Generate task
         int code = (rand() % 4) + 1;
