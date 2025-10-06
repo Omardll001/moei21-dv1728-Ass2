@@ -189,8 +189,14 @@ int main(int argc,char*argv[]){
                         continue;
                     }
                 }
-                if((size_t)n == sizeof(calcProtocol)) { // exact match -> binary calcProtocol
-                    ++pkt_binary; calcProtocol cp{}; memcpy(&cp,buf,sizeof(cp));
+                // Accept calcProtocol answers with slight size variations (padding differences) 24..32 bytes.
+                if( (size_t)n == sizeof(calcProtocol) || (n >= 24 && n <= 32) ) {
+                    if((size_t)n != sizeof(calcProtocol) && trace){
+                        cout<<"EV CPVAR size="<<n<<" expect="<<sizeof(calcProtocol)<<" addr="<<addrToString(caddr)<<" (treat-as calcProtocol)\n";
+                    }
+                    ++pkt_binary; calcProtocol cp{}; // zero-init then copy min(n, sizeof(cp))
+                    size_t copyLen = std::min<size_t>(n, sizeof(cp));
+                    memcpy(&cp,buf,copyLen);
                     uint16_t /*type*/ maj=ntohs(cp.major_version); uint16_t min=ntohs(cp.minor_version);
                 // Accept both legacy (1/2) and assignment provided (21/22) client type codes
                 if(!(maj==1 && min==1)) continue;
