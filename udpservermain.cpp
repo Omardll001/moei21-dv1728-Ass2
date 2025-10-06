@@ -31,6 +31,7 @@ struct TaskInfo {
     bool lastOk=false;         // final correctness
     Clock::time_point lastSend; // last time the task was (re)sent
     int resendCount=0;          // proactive resend attempts
+    int sockfd=-1;              // socket used for this client's address
 };
 struct ClientKey { sockaddr_storage addr{}; socklen_t len{}; bool operator==(ClientKey const& o) const noexcept { if(len!=o.len) return false; if(addr.ss_family!=o.addr.ss_family) return false; if(addr.ss_family==AF_INET){auto *a=(sockaddr_in*)&addr;auto *b=(sockaddr_in*)&o.addr; return a->sin_port==b->sin_port && a->sin_addr.s_addr==b->sin_addr.s_addr;} else {auto *a=(sockaddr_in6*)&addr;auto *b=(sockaddr_in6*)&o.addr; return a->sin6_port==b->sin6_port && memcmp(&a->sin6_addr,&b->sin6_addr,sizeof(in6_addr))==0;} } };
 struct ClientHash { size_t operator()(ClientKey const& k) const noexcept { size_t h=0xcbf29ce484222325ULL; auto mix=[&](const void* d,size_t l){auto p=(const unsigned char*)d; for(size_t i=0;i<l;++i){h^=p[i]; h*=0x100000001b3ULL;}}; if(k.addr.ss_family==AF_INET){auto *a=(sockaddr_in*)&k.addr; mix(&a->sin_port,sizeof(a->sin_port)); mix(&a->sin_addr,sizeof(a->sin_addr));} else {auto *a=(sockaddr_in6*)&k.addr; mix(&a->sin6_port,sizeof(a->sin6_port)); mix(&a->sin6_addr,sizeof(a->sin6_addr));} return h; } };
@@ -50,11 +51,13 @@ int main(int argc,char*argv[]){
     // DEBUG DEFAULT: Turned ON by default so CodeGrade run (which supplies only <host:port>) will emit EV/DIAG lines to server.log.
     // To silence, pass --nodebug explicitly.
     bool debug=true;
+    bool enableText=false; // text protocol disabled unless --text flag supplied
     if(argc<2){ cerr<<"Usage: "<<argv[0]<<" <host:port> [--nodebug]"<<"\n"; return 1; }
     if(argc>=3){
         string flag=argv[2];
         if(flag=="--nodebug") debug=false; // override to disable
         else if(flag=="--debug") debug=true; // explicit enable (already default)
+        else if(flag=="--text") enableText=true; // allow text protocol explicitly
     }
     // Environment variable can still force on (harmless if already true)
     if(!debug){ const char *e=getenv("UDPSRV_DEBUG"); if(e && *e) debug=true; }
@@ -126,7 +129,7 @@ int main(int argc,char*argv[]){
                             // Capacity guard: avoid unbounded growth if clients churn ports
                             size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
                             if(activePending>=110) { if(debug) cout<<"EV DROP newtask-cap bin(handshake) addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; continue; }
-                            TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); tasks[key]=t;
+                            TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t;
                             if(debug) cout<<"EV NEWTASK bin(handshake) id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                             out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
@@ -138,7 +141,7 @@ int main(int argc,char*argv[]){
                         } else {
                             if(debug) cout<<"EV RESEND bin(handshake) id="<<itT->second.id<<" addr="<<addrToString(caddr)<<"\n";
                             // resend ongoing task
-                            TaskInfo &t=itT->second;
+                            TaskInfo &t=itT->second; t.sockfd=s;
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                             out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                             if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-rehandshake"); else ++resend_task;
@@ -158,7 +161,7 @@ int main(int argc,char*argv[]){
                     if(idNet==0){
                         size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
                         if(activePending>=110) { if(debug) cout<<"EV DROP newtask-cap bin addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
-                        else { TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); tasks[key]=t;
+                        else { TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t;
                         if(debug) cout<<"EV NEWTASK bin id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                         calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                         out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
@@ -167,7 +170,7 @@ int main(int argc,char*argv[]){
                         // ignore unexpected first packet with non-zero id
                     }
                 } else {
-                    TaskInfo &t = it->second;
+                    TaskInfo &t = it->second; t.sockfd=s;
                     if(!t.done){
                         if(idNet==0){
                             // resend task
@@ -192,7 +195,7 @@ int main(int argc,char*argv[]){
                     } else {
                         if(idNet==0){
                             // new task request after completion
-                            TaskInfo nt=makeTask(nextId++); nt.isText=false; nt.lastSend=Clock::now(); tasks[key]=nt;
+                            TaskInfo nt=makeTask(nextId++); nt.isText=false; nt.lastSend=Clock::now(); nt.sockfd=s; tasks[key]=nt;
                             if(debug) cout<<"EV NEWTASK bin(after-done) id="<<nt.id<<" prev="<<t.id<<" ok="<<t.lastOk<<" addr="<<addrToString(caddr)<<"\n";
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                             out.id=htonl(nt.id); out.arith=htonl(nt.arith); out.inValue1=htonl(nt.v1); out.inValue2=htonl(nt.v2); out.inResult=0;
@@ -208,7 +211,7 @@ int main(int argc,char*argv[]){
                         }
                     }
                 }
-                } else { // treat as TEXT
+                } else if(enableText) { // treat as TEXT only if enabled
                     ++pkt_text;
                     string txt((char*)buf,(size_t)n);
                     txt.erase(remove(txt.begin(),txt.end(),'\r'),txt.end());
@@ -218,12 +221,12 @@ int main(int argc,char*argv[]){
                         if(it==tasks.end() || it->second.done){
                             size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
                             if(activePending>=110) { if(debug) cout<<"EV DROP newtask-cap text addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
-                            else { TaskInfo t=makeTask(nextId++); t.isText=true; t.lastSend=Clock::now(); tasks[key]=t;
+                            else { TaskInfo t=makeTask(nextId++); t.isText=true; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t;
                             if(debug) cout<<"EV NEWTASK text id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                             string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
                             if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-task"); else ++tasks_issued; }
                         } else if(it->second.isText){
-                            TaskInfo &t=it->second; string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
+                            TaskInfo &t=it->second; t.sockfd=s; string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
                             if(debug) cout<<"EV RESEND text id="<<t.id<<" addr="<<addrToString(caddr)<<"\n";
                             if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-resend"); else ++resend_task;
                             t.lastSend=Clock::now();
@@ -253,19 +256,23 @@ int main(int argc,char*argv[]){
                 }
             }
         }
-        // Proactive resend: for pending tasks not done, resend every 600ms up to 3 times
+        // Proactive resend: for pending tasks not done, resend every 400ms until age>=10s using correct socket
         auto nowPR = Clock::now();
         for(auto &kv : tasks){
             TaskInfo &t = kv.second; if(t.done) continue; auto ms=chrono::duration_cast<chrono::milliseconds>(nowPR - t.lastSend).count();
-            if(ms>=600 && t.resendCount < 3){
+            auto ageS = chrono::duration_cast<chrono::seconds>(nowPR - t.ts).count();
+            if(ageS>=10) continue; // nearing cleanup
+            if(ms>=400){
+                int useSock = (t.sockfd>=0)? t.sockfd : (socks.empty()? -1 : socks[0]);
+                if(useSock<0) continue;
                 const sockaddr_storage &caddr = kv.first.addr; socklen_t clen = kv.first.len;
                 if(t.isText){
                     string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
-                    if(sendto(socks[0],line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-proactive-text"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; if(debug) cout<<"EV PROACTIVE_RESEND text id="<<t.id<<" cnt="<<t.resendCount<<"\n"; }
+                    if(sendto(useSock,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-proactive-text"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; if(debug) cout<<"EV PROACTIVE_RESEND text id="<<t.id<<" cnt="<<t.resendCount<<"\n"; }
                 } else {
                     calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                     out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
-                    if(sendto(socks[0],&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-proactive-bin"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; if(debug) cout<<"EV PROACTIVE_RESEND bin id="<<t.id<<" cnt="<<t.resendCount<<"\n"; }
+                    if(sendto(useSock,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-proactive-bin"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; if(debug) cout<<"EV PROACTIVE_RESEND bin id="<<t.id<<" cnt="<<t.resendCount<<"\n"; }
                 }
             }
         }
