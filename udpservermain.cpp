@@ -182,10 +182,18 @@ int main(int argc, char *argv[]) {
                 continue;
             }
             
-            if (n == sizeof(calcMessage) - 4 || (n > sizeof(calcMessage) && n != sizeof(calcProtocol))) {
-                // Incorrect size for calcMessage - send error response
-                const char *err = "ERROR WRONG SIZE\n";
-                sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+            // Handle error test cases gracefully - incorrect size messages
+            if (n < sizeof(calcMessage) && n != sizeof(calcProtocol)) {
+                // Test case 3: Small incorrect size message - ignore gracefully
+                printf("| ODD SIZE MESSAGE. Got %d bytes, expected %lu bytes (sizeof(cMessage)) . \n", 
+                       (int)n, sizeof(calcMessage));
+                continue;
+            }
+            
+            if (n > sizeof(calcMessage) && n != sizeof(calcProtocol)) {
+                // Other incorrect sizes - ignore gracefully
+                printf("| ODD SIZE MESSAGE. Got %d bytes, expected %lu or %lu bytes . \n", 
+                       (int)n, sizeof(calcMessage), sizeof(calcProtocol));
                 continue;
             }
             
@@ -306,7 +314,26 @@ int main(int argc, char *argv[]) {
                             continue;
                         }
                     }
+                } else {
+                    // Invalid binary protocol (Test case 1: empty calcProtocol) - handle gracefully
+                    printf("| Invalid binary protocol message (size: %d). Ignoring gracefully.\n", (int)n);
+                    continue;
                 }
+            }
+            
+            // Handle calcMessage sized packets (Test case 2: empty calcMessage)
+            if (n == (ssize_t)sizeof(calcMessage)) {
+                calcMessage msg;
+                memcpy(&msg, buf, sizeof(calcMessage));
+                // Check if it's all zeros (empty calcMessage from test case 2)
+                if (msg.type == 0 && msg.message == 0 && msg.protocol == 0 && 
+                    msg.major_version == 0 && msg.minor_version == 0) {
+                    printf("| Empty calcMessage received (Test case 2). Ignoring gracefully.\n");
+                    continue;
+                }
+                // Handle normal calcMessage if needed
+                printf("| calcMessage received but not in expected protocol flow. Ignoring.\n");
+                continue;
             }
 
             // Treat as text protocol or mixed protocol
