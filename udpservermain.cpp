@@ -10,6 +10,7 @@
 #include <cstring>
 #include <csignal>
 #include <algorithm>
+#include <sstream>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -40,8 +41,21 @@ static const char* opname(uint32_t a){ switch(a){case 1:return "add"; case 2:ret
 
 static bool splitAddress(const string &arg,string &host,string &port){ auto p=arg.rfind(':'); if(p==string::npos) return false; host=arg.substr(0,p); port=arg.substr(p+1); return !host.empty() && !port.empty(); }
 
+static string addrToString(const sockaddr_storage &ss){
+    char host[INET6_ADDRSTRLEN]="?"; uint16_t port=0; if(ss.ss_family==AF_INET){ auto *a=(sockaddr_in*)&ss; inet_ntop(AF_INET,&a->sin_addr,host,sizeof(host)); port=ntohs(a->sin_port);} else if(ss.ss_family==AF_INET6){ auto *a=(sockaddr_in6*)&ss; inet_ntop(AF_INET6,&a->sin6_addr,host,sizeof(host)); port=ntohs(a->sin6_port);} stringstream os; os<<host<<":"<<port; return os.str(); }
+
 int main(int argc,char*argv[]){
-    if(argc!=2){ cerr<<"Usage: "<<argv[0]<<" <host:port>\n"; return 1; }
+    // DEBUG DEFAULT: Turned ON by default so CodeGrade run (which supplies only <host:port>) will emit EV/DIAG lines to server.log.
+    // To silence, pass --nodebug explicitly.
+    bool debug=true;
+    if(argc<2){ cerr<<"Usage: "<<argv[0]<<" <host:port> [--nodebug]"<<"\n"; return 1; }
+    if(argc>=3){
+        string flag=argv[2];
+        if(flag=="--nodebug") debug=false; // override to disable
+        else if(flag=="--debug") debug=true; // explicit enable (already default)
+    }
+    // Environment variable can still force on (harmless if already true)
+    if(!debug){ const char *e=getenv("UDPSRV_DEBUG"); if(e && *e) debug=true; }
     signal(SIGINT,handle_sig); initCalcLib();
     string host,port; if(!splitAddress(argv[1],host,port)){ cerr<<"Bad address format\n"; return 1; }
     bool specialLocalHost = (host=="localhost");
@@ -66,7 +80,7 @@ int main(int argc,char*argv[]){
     // Fallback: if 'localhost' given but nothing worked, try generic resolution once
     if(socks.empty() && specialLocalHost){ doBind("localhost"); }
     if(socks.empty()){ cerr<<"bind failed\n"; return 1; }
-    cout<<"udpserver running on "<<host<<":"<<port<<" sockets="<<socks.size()<<"\n"; cout.flush();
+    cout<<"udpserver running on "<<host<<":"<<port<<" sockets="<<socks.size(); if(debug) cout<<" DEBUG=on"; cout<<"\n"; cout.flush();
     unordered_map<ClientKey,TaskInfo,ClientHash> tasks; uint32_t nextId=1;
     // Diagnostics counters (debug only)
     size_t pkt_recv=0, pkt_binary=0, pkt_text=0, tasks_issued=0, answers_ok=0, answers_fail=0, resend_task=0, reack=0;
@@ -108,13 +122,16 @@ int main(int argc,char*argv[]){
                         auto itT=tasks.find(key);
                         if(itT==tasks.end()){
                             TaskInfo t=makeTask(nextId++); t.isText=false; tasks[key]=t;
+                            if(debug) cout<<"EV NEWTASK bin(handshake) id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                             out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                             if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-handshake"); else ++tasks_issued;
                         } else if(itT->second.done){
+                            if(debug) cout<<"EV REACK bin id="<<itT->second.id<<" ok="<<itT->second.lastOk<<" addr="<<addrToString(caddr)<<"\n";
                             calcMessage msg{}; msg.type=htons(2); msg.message=htonl(itT->second.lastOk?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
                             if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-reack-msg"); else ++reack;
                         } else {
+                            if(debug) cout<<"EV RESEND bin(handshake) id="<<itT->second.id<<" addr="<<addrToString(caddr)<<"\n";
                             // resend ongoing task
                             TaskInfo &t=itT->second;
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
@@ -135,6 +152,7 @@ int main(int argc,char*argv[]){
                 if(it==tasks.end()){
                     if(idNet==0){
                         TaskInfo t=makeTask(nextId++); t.isText=false; tasks[key]=t;
+                        if(debug) cout<<"EV NEWTASK bin id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                         calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                         out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                         if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-task"); else ++tasks_issued;
@@ -146,6 +164,7 @@ int main(int argc,char*argv[]){
                     if(!t.done){
                         if(idNet==0){
                             // resend task
+                            if(debug) cout<<"EV RESEND bin id="<<t.id<<" addr="<<addrToString(caddr)<<"\n";
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                             out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                             if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-resend"); else ++resend_task;
@@ -156,14 +175,17 @@ int main(int argc,char*argv[]){
                             calcMessage msg{}; msg.type=htons(2); bool ok=(age<=10)&&(inRes==real);
                             msg.message=htonl(ok?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
                             if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-answer");
+                            if(debug) cout<<"EV ANSWER bin id="<<t.id<<" ok="<<ok<<" expect="<<real<<" got="<<inRes<<" age="<<age<<" addr="<<addrToString(caddr)<<"\n";
                             if(ok) ++answers_ok; else ++answers_fail; t.done=true; t.finished=Clock::now(); t.lastOk=ok;
                         } else {
+                            if(debug) cout<<"EV STRAY bin curId="<<t.id<<" gotId="<<idNet<<" addr="<<addrToString(caddr)<<"\n";
                             // stray answer ignored
                         }
                     } else {
                         if(idNet==0){
                             // new task request after completion
                             TaskInfo nt=makeTask(nextId++); nt.isText=false; tasks[key]=nt;
+                            if(debug) cout<<"EV NEWTASK bin(after-done) id="<<nt.id<<" prev="<<t.id<<" ok="<<t.lastOk<<" addr="<<addrToString(caddr)<<"\n";
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                             out.id=htonl(nt.id); out.arith=htonl(nt.arith); out.inValue1=htonl(nt.v1); out.inValue2=htonl(nt.v2); out.inResult=0;
                             if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-newtask"); else ++tasks_issued;
@@ -171,7 +193,9 @@ int main(int argc,char*argv[]){
                             // duplicate answer re-ACK
                             calcMessage msg{}; msg.type=htons(2); msg.message=htonl(t.lastOk?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
                             if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-reack"); else ++reack;
+                            if(debug) cout<<"EV REACK bin duplicate id="<<t.id<<" ok="<<t.lastOk<<" addr="<<addrToString(caddr)<<"\n";
                         } else {
+                            if(debug) cout<<"EV STRAY bin-done prevId="<<t.id<<" gotId="<<idNet<<" addr="<<addrToString(caddr)<<"\n";
                             // ignore
                         }
                     }
@@ -185,10 +209,12 @@ int main(int argc,char*argv[]){
                     if(txt=="TEXT UDP 1.1"){
                         if(it==tasks.end() || it->second.done){
                             TaskInfo t=makeTask(nextId++); t.isText=true; tasks[key]=t;
+                            if(debug) cout<<"EV NEWTASK text id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                             string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
                             if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-task"); else ++tasks_issued;
                         } else if(it->second.isText){
                             TaskInfo &t=it->second; string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
+                            if(debug) cout<<"EV RESEND text id="<<t.id<<" addr="<<addrToString(caddr)<<"\n";
                             if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-resend"); else ++resend_task;
                         } else {
                             // binary task active, ignore text request
@@ -203,10 +229,12 @@ int main(int argc,char*argv[]){
                                 long long real=eval(it->second); bool ok=(age<=10)&&(ans==real);
                                 string resp=(ok?"OK ":"NOT OK ");
                                 if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-answer");
+                                if(debug) cout<<"EV ANSWER text id="<<it->second.id<<" ok="<<ok<<" expect="<<real<<" got="<<ans<<" addr="<<addrToString(caddr)<<"\n";
                                 if(ok) ++answers_ok; else ++answers_fail; it->second.done=true; it->second.finished=Clock::now(); it->second.lastOk=ok;
                             } else if(parsed){
                                 string resp=string("NOT OK ");
                                 if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-reject");
+                                if(debug) cout<<"EV ANSWER text WRONG rid="<<rid<<" cur="<<it->second.id<<" addr="<<addrToString(caddr)<<"\n";
                                 ++answers_fail; it->second.done=true; it->second.finished=Clock::now(); it->second.lastOk=false;
                             }
                         }
@@ -216,7 +244,13 @@ int main(int argc,char*argv[]){
         }
         // (No periodic proactive resend: rely on client re-request id==0)
         auto now2 = Clock::now(); if(chrono::duration_cast<chrono::seconds>(now2 - lastDiag).count()>=1){
-            cerr << "DIAG pkts="<<pkt_recv<<" bin="<<pkt_binary<<" txt="<<pkt_text<<" tasks="<<tasks_issued<<" resend="<<resend_task<<" ok="<<answers_ok<<" fail="<<answers_fail<<" reack="<<reack<<" outstanding="<<tasks.size()<<"\n"; lastDiag=now2;
+            // Always send DIAG to stdout so CodeGrade captures it in server.log
+            if(debug) {
+                cout << "DIAG pkts="<<pkt_recv<<" bin="<<pkt_binary<<" txt="<<pkt_text<<" tasks="<<tasks_issued<<" resend="<<resend_task<<" ok="<<answers_ok<<" fail="<<answers_fail<<" reack="<<reack<<" outstanding="<<tasks.size()<<"\n";
+            } else {
+                cout << "DIAG pkts="<<pkt_recv<<" tasks="<<tasks_issued<<" ok="<<answers_ok<<" fail="<<answers_fail<<" out="<<tasks.size()<<"\n";
+            }
+            lastDiag=now2;
         }
     }
     for(int s: socks) {
