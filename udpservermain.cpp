@@ -49,7 +49,18 @@ int setup_socket(const char *host, const char *port) {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_flags = AI_PASSIVE;
-    if (getaddrinfo(host, port, &hints, &res) != 0) return -1;
+    
+    // Handle special test hostnames
+    const char *actual_host = host;
+    if (strcmp(host, "ip4-localhost") == 0) {
+        actual_host = "127.0.0.1";
+        hints.ai_family = AF_INET;  // Force IPv4
+    } else if (strcmp(host, "ip6-localhost") == 0) {
+        actual_host = "::1";
+        hints.ai_family = AF_INET6; // Force IPv6
+    }
+    
+    if (getaddrinfo(actual_host, port, &hints, &res) != 0) return -1;
     int fd = -1;
     for (rp = res; rp != NULL; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
