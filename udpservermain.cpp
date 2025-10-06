@@ -51,21 +51,23 @@ int main(int argc,char*argv[]){
         timeval tv{0,10000}; int sel=select(maxfd+1,&rf,nullptr,nullptr,&tv); if(sel<0){ if(errno==EINTR) continue; perror("select"); break; }
         auto now=Clock::now();
     // (Removed hard timeout and idle watchdog as per user request)
-    // Cleanup: completed >2s or unfinished older than 10s
-        for(auto it=tasks.begin(); it!=tasks.end();){ auto age=chrono::duration_cast<chrono::seconds>(now - it->second.created).count(); if( (it->second.done && age>2) || (!it->second.done && age>10) ){ it=tasks.erase(it); } else ++it; }
+    // Cleanup: only purge completed tasks after 5s; keep unfinished to allow late answers
+        for(auto it=tasks.begin(); it!=tasks.end();){ auto age=chrono::duration_cast<chrono::seconds>(now - it->second.created).count(); if( it->second.done && age>5 ){ it=tasks.erase(it); } else ++it; }
         if(sel>0){
             for(int s: sockets){ if(!FD_ISSET(s,&rf)) continue; for(int drain=0; drain<512; ++drain){ sockaddr_storage ca{}; socklen_t clen=sizeof(ca); unsigned char buf[128]; ssize_t n=recvfrom(s,buf,sizeof(buf),MSG_DONTWAIT,(sockaddr*)&ca,&clen); if(n<0){ if(errno==EAGAIN||errno==EWOULDBLOCK) break; perror("recvfrom"); break; } if(n==0) break; ClientKey key{ca,clen};
                 // Packet debug (first 15 packets overall)
                 static int rawDebugCount=0; if(rawDebugCount<15){ cout<<"RAW len="<<n; if(n>=2) cout<<" b0="<<(int)buf[0]<<" b1="<<(int)buf[1]; cout<<"\n"; ++rawDebugCount; }
                 auto existing = tasks.find(key);
-                // Handshake path: calcMessage size 12 (or 13) from client types 21/22
+                // Handshake path: client sends calcMessage (12 bytes) type 21 (text) or 22 (binary)
                 if(n==sizeof(calcMessage) || n==13){ calcMessage cm{}; memcpy(&cm,buf,sizeof(cm)); uint16_t ctype=ntohs(cm.type); uint16_t maj=ntohs(cm.major_version), min=ntohs(cm.minor_version); if(maj==1 && min==1 && (ctype==21 || ctype==22)){
-                        // ACK
-                        calcMessage ack{}; ack.type=htons( (ctype==21)?1:2 ); // mirror protocol style (text or binary)
-                        ack.message=htonl(1); ack.protocol=htons(17); ack.major_version=htons(1); ack.minor_version=htons(1); sendto(s,&ack,sizeof(ack),0,(sockaddr*)&ca,clen);
                         bool wantText = enableText && ctype==21;
-                        if(existing==tasks.end() || existing->second.done){ Task t=makeTask(nextId++); t.text=wantText; tasks[key]=t; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); ++issued; }
-                        else { Task &t=existing->second; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); }
+                        // For binary clients (22) DO NOT send 12-byte ACK (client expects first reply = calcProtocol)
+                        // For text clients (21) send a text line directly (optionally could ACK first, but skip to save RTT)
+                        if(existing==tasks.end() || existing->second.done){ Task t=makeTask(nextId++); t.text=wantText; tasks[key]=t; if(wantText){ string line=to_string(t.id)+" "+(t.op==1?"add":t.op==2?"sub":t.op==3?"mul":"div")+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n"; sendto(s,line.c_str(),line.size(),0,(sockaddr*)&ca,clen); }
+                            else { calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); }
+                            ++issued; }
+                        else { Task &t=existing->second; if(wantText){ string line=to_string(t.id)+" "+(t.op==1?"add":t.op==2?"sub":t.op==3?"mul":"div")+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n"; sendto(s,line.c_str(),line.size(),0,(sockaddr*)&ca,clen); }
+                            else { calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); } }
                         continue; }
                 }
                 // If new client sends calcProtocol directly with id=0 treat as implicit handshake
