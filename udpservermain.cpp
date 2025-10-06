@@ -405,8 +405,14 @@ int main(int argc, char *argv[]) {
                             calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1; out.id = cs.task_id; out.arith = cs.arith; out.inValue1 = cs.v1; out.inValue2 = cs.v2; out.inResult = 0;
                             send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
                         } else if (cs.finished) {
-                            // Already completed; re-send final ACK as calcMessage
-                            send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, cs.last_ack == 1 ? 1 : 2);
+                            // Start a new round so client can proceed to completion summary
+                            cs.is_binary = true; cs.waiting = true; cs.finished = false; cs.last_ack = 0; cs.timestamp = now;
+                            uint32_t code = (rand() % 4) + 1; int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
+                            int32_t expected = (code == 1) ? (a + b) : (code == 2) ? (a - b) : (code == 3) ? (a * b) : (a / b);
+                            uint32_t id = (uint32_t)(rand() ^ time(NULL));
+                            cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
+                            calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1; out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
+                            send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
                         } else {
                             // Unexpected state -> start fresh task
                             cs.is_binary = true; cs.waiting = true; cs.finished = false; cs.last_ack = 0; cs.timestamp = now;
