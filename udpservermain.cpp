@@ -17,10 +17,6 @@
 #include <unistd.h>
 #include "protocol.h"
 #include "calcLib.h"
-#include "myGitdata.h"
-#ifndef COMMIT_HASH
-#define COMMIT_HASH "unknown"
-#endif
 
 using namespace std;
 using Clock = chrono::steady_clock;
@@ -205,11 +201,11 @@ int main(int argc,char*argv[]){
                             if(parsed && rid==it->second.id){
                                 auto age=chrono::duration_cast<chrono::seconds>(now - it->second.ts).count();
                                 long long real=eval(it->second); bool ok=(age<=10)&&(ans==real);
-                                string resp=(ok?"OK ":"NOT OK ")+string(COMMIT_HASH)+"\n";
+                                string resp=(ok?"OK ":"NOT OK ");
                                 if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-answer");
                                 if(ok) ++answers_ok; else ++answers_fail; it->second.done=true; it->second.finished=Clock::now(); it->second.lastOk=ok;
                             } else if(parsed){
-                                string resp=string("NOT OK ")+COMMIT_HASH+"\n";
+                                string resp=string("NOT OK ");
                                 if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-reject");
                                 ++answers_fail; it->second.done=true; it->second.finished=Clock::now(); it->second.lastOk=false;
                             }
