@@ -23,7 +23,7 @@
 #include <poll.h>
 #include <vector>
 #include <string>
-
+#include <ctype.h>
 
 
 #include "protocol.h"
@@ -103,9 +103,12 @@ void handle_binary_client(int fd) {
 
     // Send BINARY TCP 1.1 greeting immediately
     const char *greeting = "BINARY TCP 1.1\n";
+    fprintf(stderr, "handle_binary_client: about to send greeting\n");
     alarm(5);
     ssize_t sent = write(fd, greeting, strlen(greeting));
     alarm(0);
+    fprintf(stderr, "handle_binary_client: write returned %zd (errno=%d %s)\n", sent, (sent<0)?errno:0, (sent<0)?strerror(errno):"");
+    
     if (sent != (ssize_t)strlen(greeting)) {
         close(fd);
         return;
@@ -358,6 +361,7 @@ void handle_text_client(int fd) {
     close(fd);
 }
 
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s host:port\n", argv[0]);
@@ -461,17 +465,41 @@ int main(int argc, char *argv[]) {
 
             // If the token "binary" appears anywhere in the peeked bytes -> treat as request for binary
             if (lower.find("binary") != std::string::npos) {
-                // Consume all bytes currently available (so the binary handler sees a clean socket)
-                int avail = 0;
-                if (ioctl(connfd, FIONREAD, &avail) == -1) {
-                    perror("ioctl FIONREAD");
-                    // best-effort: fallback to reading nothing and proceed to binary handler
-                } else if (avail > 0) {
-                    std::vector<char> drain((size_t)avail);
-                    ssize_t rr = read(connfd, drain.data(), avail); // won't block because avail bytes ready
-                    (void)rr; // ignore exact count; just draining
+                // ---------- REPLACED BLOCK: consume only the first line (up to newline) ----------
+                // find position of first newline in the peeked buffer
+                size_t nlpos = std::string::npos;
+                for (size_t i = 0; i < got; ++i) {
+                    if (peekbuf[i] == '\n') { nlpos = i; break; }
                 }
-                fprintf(stderr, "protocol-detect: instruction contained 'binary' -> switching to binary (consumed %d bytes)\n", avail);
+
+                if (nlpos == std::string::npos) {
+                    // We found 'binary' but didn't see a newline in the peek buffer.
+                    // Best option: try to read until we encounter newline, but only a bounded amount
+                    // so we don't block forever. Use ioctl(FIONREAD) to know how many bytes can be read without blocking.
+                    int avail = 0;
+                    if (ioctl(connfd, FIONREAD, &avail) == -1) avail = 0;
+                    if (avail > 0) {
+                        // read what's available (but this is a fallback; ideally newline is in the peek)
+                        std::vector<char> tmp((size_t)avail);
+                        ssize_t rr = read(connfd, tmp.data(), avail);
+                        (void)rr;
+                    }
+                    fprintf(stderr, "protocol-detect: token 'binary' but no newline in peek; performed fallback read(%d)\n", avail);
+                } else {
+                    // consume exactly nlpos+1 bytes (include the newline)
+                    size_t to_consume = nlpos + 1;
+                    size_t consumed = 0;
+                    while (consumed < to_consume) {
+                        ssize_t rn = read(connfd, peekbuf.data(), (int)std::min(peekbuf.size(), to_consume - consumed));
+                        if (rn <= 0) break; // should not block because we peeked the bytes earlier
+                        consumed += (size_t)rn;
+                    }
+                    fprintf(stderr, "protocol-detect: consumed first line (%zu bytes): '%.100s'\n",
+                            consumed, std::string(peekbuf.data(), peekbuf.data() + std::min((size_t)consumed, (size_t)100)).c_str());
+                }
+                // ------------------------------------------------------------------------------
+
+                fprintf(stderr, "protocol-detect: instruction contained 'binary' -> switching to binary\n");
                 handle_binary_client(connfd);
                 _exit(0);
             }
