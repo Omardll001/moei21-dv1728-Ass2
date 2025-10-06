@@ -65,6 +65,12 @@ int setup_socket(const char *host, const char *port) {
     for (rp = res; rp != NULL; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd == -1) continue;
+        
+        // Optimize socket buffers for high concurrency
+        int buffer_size = 1024 * 1024; // 1MB buffers
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
+        
         if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
         close(fd); 
         fd = -1;
@@ -154,14 +160,14 @@ int main(int argc, char *argv[]) {
         FD_SET(sockfd, &rfds);
         struct timeval tv; 
         tv.tv_sec = 0; 
-        tv.tv_usec = 1000; // 1ms timeout for maximum responsiveness
+        tv.tv_usec = 100; // 0.1ms timeout for high performance
         
         int rv = select(sockfd + 1, &rfds, NULL, NULL, &tv);
         time_t now = time(NULL);
         
-        // Cleanup stale clients (>10s waiting) - only every 100 iterations for performance
+        // Cleanup stale clients (>10s waiting) - only every 1000 iterations for performance
         static int cleanup_counter = 0;
-        if (++cleanup_counter >= 100) {
+        if (++cleanup_counter >= 1000) {
             cleanup_counter = 0;
             std::vector<ClientKey> to_delete;
             for (auto &p : clients) {
