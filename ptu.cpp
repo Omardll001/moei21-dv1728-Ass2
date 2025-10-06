@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cstring>
+#include <string>
 #include "protocol.h"
 #include "myGitdata.h"
 
@@ -38,7 +39,7 @@ int main(int argc, char* argv[]) {
             char malformed[20] = {0};
             sendto(sock, malformed, sizeof(malformed), 0, (struct sockaddr*)&addr, sizeof(addr));
         }
-        cout << "SUMMARY: | OK | " << COMMIT_HASH << " | " << random_value << " |" << endl;
+        cout << "SUMMARY: | OK | commit " << COMMIT_HASH << " | " << random_value << " |" << endl;
     } else {
         calcProtocol cp = {0};
         cp.type = htons(22);
@@ -77,7 +78,7 @@ int main(int argc, char* argv[]) {
         cout << "UDP Binary Protocol Test Completed" << endl;
         cout << "Task: " << arith << " " << val1 << " " << val2 << " = " << result << endl;
         cout << "Server Response: OK" << endl;
-        cout << "SUMMARY: | OK | " << COMMIT_HASH << " | " << random_value << " |" << endl;
+        cout << "SUMMARY: | OK | commit " << COMMIT_HASH << " | " << random_value << " |" << endl;
     }
     
     close(sock);

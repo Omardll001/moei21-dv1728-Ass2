@@ -153,8 +153,8 @@ int main(int argc, char *argv[]) {
         FD_ZERO(&rfds);
         FD_SET(sockfd, &rfds);
         struct timeval tv; 
-        tv.tv_sec = 1; 
-        tv.tv_usec = 0;
+        tv.tv_sec = 0; 
+        tv.tv_usec = 10000; // 10ms timeout for better responsiveness
         
         int rv = select(sockfd + 1, &rfds, NULL, NULL, &tv);
         time_t now = time(NULL);
