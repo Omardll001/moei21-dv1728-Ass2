@@ -25,7 +25,14 @@
 using namespace std;
 using Clock = chrono::steady_clock;
 
-struct TaskInfo { uint32_t id; uint32_t arith; int32_t v1; int32_t v2; Clock::time_point ts; bool isText=false; };
+struct TaskInfo {
+    uint32_t id; uint32_t arith; int32_t v1; int32_t v2;
+    Clock::time_point ts;      // creation / issue time
+    Clock::time_point finished;// time when answer accepted (for re-ACK window)
+    bool isText=false;         // text protocol task
+    bool done=false;           // answer validated and final message sent
+    bool lastOk=false;         // final correctness result for accurate re-ACK
+};
 struct ClientKey { sockaddr_storage addr{}; socklen_t len{}; bool operator==(ClientKey const& o) const noexcept { if(len!=o.len) return false; if(addr.ss_family!=o.addr.ss_family) return false; if(addr.ss_family==AF_INET){auto *a=(sockaddr_in*)&addr;auto *b=(sockaddr_in*)&o.addr; return a->sin_port==b->sin_port && a->sin_addr.s_addr==b->sin_addr.s_addr;} else {auto *a=(sockaddr_in6*)&addr;auto *b=(sockaddr_in6*)&o.addr; return a->sin6_port==b->sin6_port && memcmp(&a->sin6_addr,&b->sin6_addr,sizeof(in6_addr))==0;} } };
 struct ClientHash { size_t operator()(ClientKey const& k) const noexcept { size_t h=0xcbf29ce484222325ULL; auto mix=[&](const void* d,size_t l){auto p=(const unsigned char*)d; for(size_t i=0;i<l;++i){h^=p[i]; h*=0x100000001b3ULL;}}; if(k.addr.ss_family==AF_INET){auto *a=(sockaddr_in*)&k.addr; mix(&a->sin_port,sizeof(a->sin_port)); mix(&a->sin_addr,sizeof(a->sin_addr));} else {auto *a=(sockaddr_in6*)&k.addr; mix(&a->sin6_port,sizeof(a->sin6_port)); mix(&a->sin6_addr,sizeof(a->sin6_addr));} return h; } };
 
@@ -66,12 +73,24 @@ int main(int argc,char*argv[]){
     cout<<"udpserver running on "<<host<<":"<<port<<" sockets="<<socks.size()<<"\n"; cout.flush();
     unordered_map<ClientKey,TaskInfo,ClientHash> tasks; uint32_t nextId=1;
     // Diagnostics counters
-    size_t pkt_recv=0, pkt_binary=0, pkt_text=0, tasks_issued=0, answers_ok=0, answers_fail=0, resend_task=0;
+    size_t pkt_recv=0, pkt_binary=0, pkt_text=0, tasks_issued=0, answers_ok=0, answers_fail=0, resend_task=0, reack=0;
     auto lastDiag = Clock::now();
     while(g_run){
         fd_set rfds; FD_ZERO(&rfds); int maxfd=0; for(int s: socks){ FD_SET(s,&rfds); if(s>maxfd) maxfd=s; }
-        timeval tv{0,100000}; int sel=select(maxfd+1,&rfds,nullptr,nullptr,&tv); if(sel<0){ if(errno==EINTR) continue; perror("select"); break; }
-        auto now=Clock::now(); for(auto it=tasks.begin(); it!=tasks.end();){ auto age=chrono::duration_cast<chrono::seconds>(now - it->second.ts).count(); if(age>10) it=tasks.erase(it); else ++it; }
+        // Reduced latency: 10ms select timeout
+        timeval tv{0,10000}; int sel=select(maxfd+1,&rfds,nullptr,nullptr,&tv); if(sel<0){ if(errno==EINTR) continue; perror("select"); break; }
+        auto now=Clock::now();
+        // Cleanup: remove tasks older than 10s if not done; if done keep for 2s for possible re-ACK needs
+        for(auto it=tasks.begin(); it!=tasks.end();){
+            auto age = chrono::duration_cast<chrono::seconds>(now - it->second.ts).count();
+            if(!it->second.done) {
+                if(age>10) { it = tasks.erase(it); continue; }
+            } else {
+                auto doneAge = chrono::duration_cast<chrono::milliseconds>(now - it->second.finished).count();
+                if(doneAge > 2000) { it = tasks.erase(it); continue; }
+            }
+            ++it;
+        }
         if(sel==0) continue;
         for(int s: socks){
             if(!FD_ISSET(s,&rfds)) continue;
@@ -84,7 +103,33 @@ int main(int argc,char*argv[]){
                 if(n<0) break;
                 ++pkt_recv;
                 ClientKey key; key.addr=caddr; key.len=clen;
-                if((size_t)n == sizeof(calcProtocol)) { // exact match -> binary
+                if((size_t)n == sizeof(calcMessage)) {
+                    // calcMessage considered only for (re)handshake or re-ACK request; never creates a new task if one is already active.
+                    calcMessage cm{}; memcpy(&cm,buf,sizeof(cm));
+                    uint16_t ctype = ntohs(cm.type); uint16_t maj = ntohs(cm.major_version); uint16_t min = ntohs(cm.minor_version);
+                    if(maj==1 && min==1 && (ctype==22 || ctype==21)) {
+                        auto itT = tasks.find(key);
+                        if(itT==tasks.end()) {
+                            // No active task: issue a fresh one
+                            TaskInfo t = makeTask(nextId++); t.isText=false; tasks[key]=t;
+                            calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
+                            out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
+                            if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-handshake"); else ++tasks_issued;
+                        } else if(itT->second.done) {
+                            // Completed: send final result again
+                            calcMessage msg{}; msg.type=htons(2); msg.message=htonl(itT->second.lastOk?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
+                            if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-reack-msg"); else ++reack;
+                        } else {
+                            // Active and not done: resend original task (avoid generating a different one)
+                            TaskInfo &t = itT->second;
+                            calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
+                            out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
+                            if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-rehandshake"); else ++resend_task;
+                        }
+                        continue; // handled
+                    }
+                }
+                if((size_t)n == sizeof(calcProtocol)) { // exact match -> binary calcProtocol
                     ++pkt_binary; calcProtocol cp{}; memcpy(&cp,buf,sizeof(cp));
                     uint16_t /*type*/ maj=ntohs(cp.major_version); uint16_t min=ntohs(cp.minor_version);
                 // Accept both legacy (1/2) and assignment provided (21/22) client type codes
@@ -104,12 +149,9 @@ int main(int argc,char*argv[]){
                         out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                         if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-task"); else ++tasks_issued;
                     } else {
-                        // Unknown task id from client without existing state -> reject
+                        // Unknown task id: reject so client can stop
                         calcMessage msg{}; msg.type=htons(2); msg.message=htonl(2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
-                        if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) {
-                            perror("sendto-reject");
-                        }
-                        ++answers_fail;
+                        if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-reject"); ++answers_fail;
                     }
                 } else {
                     TaskInfo &t=it->second;
@@ -126,9 +168,10 @@ int main(int argc,char*argv[]){
                         msg.message=htonl(ok?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
                         if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-answer");
                         if(ok) ++answers_ok; else ++answers_fail;
-                        tasks.erase(it);
+                        t.done=true; t.finished=Clock::now(); t.lastOk=ok;
                     } else {
-                        // Different id -> ignore or optionally send rejection (ignore silently to be tolerant)
+                        // Different id (stale/late) -> silently ignore to avoid counting as failure.
+                        // Intentionally no NOT OK response here.
                     }
                 }
                 } else { // treat as TEXT
@@ -152,11 +195,11 @@ int main(int argc,char*argv[]){
                                 long long real=eval(it->second); bool ok=(age<=10)&&(ans==real);
                                 string resp=(ok?"OK ":"NOT OK ")+string(COMMIT_HASH)+"\n";
                                 if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-answer");
-                                if(ok) ++answers_ok; else ++answers_fail; tasks.erase(it);
+                                if(ok) ++answers_ok; else ++answers_fail; it->second.done=true; it->second.finished=Clock::now(); it->second.lastOk=ok;
                             } else if(parsed){
                                 string resp=string("NOT OK ")+COMMIT_HASH+"\n";
                                 if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-reject");
-                                ++answers_fail; tasks.erase(it);
+                                ++answers_fail; it->second.done=true; it->second.finished=Clock::now(); it->second.lastOk=false;
                             }
                         }
                     }
@@ -164,7 +207,7 @@ int main(int argc,char*argv[]){
             }
         }
         auto now2 = Clock::now(); if(chrono::duration_cast<chrono::seconds>(now2 - lastDiag).count()>=1){
-            cerr << "DIAG pkts="<<pkt_recv<<" bin="<<pkt_binary<<" txt="<<pkt_text<<" tasks="<<tasks_issued<<" resend="<<resend_task<<" ok="<<answers_ok<<" fail="<<answers_fail<<" outstanding="<<tasks.size()<<"\n"; lastDiag=now2;
+            cerr << "DIAG pkts="<<pkt_recv<<" bin="<<pkt_binary<<" txt="<<pkt_text<<" tasks="<<tasks_issued<<" resend="<<resend_task<<" ok="<<answers_ok<<" fail="<<answers_fail<<" reack="<<reack<<" outstanding="<<tasks.size()<<"\n"; lastDiag=now2;
         }
     }
     for(int s: socks) {
