@@ -25,12 +25,11 @@ static int32_t eval(const Task&t){ switch(t.op){case 1:return t.v1+t.v2; case 2:
 static bool splitAddr(const string&s,string&h,string&p){ auto pos=s.rfind(':'); if(pos==string::npos) return false; h=s.substr(0,pos); p=s.substr(pos+1); return !h.empty() && !p.empty(); }
 
 int main(int argc,char*argv[]){
-    if(argc<2){ cerr<<"Usage: "<<argv[0]<<" host:port [--text] [--quiet] [--exit-on-complete] [--timeout=N]\n"; return 1; }
-    bool enableText=false, quiet=false, exitOnComplete=false; int hardTimeoutSec=60; // default 60s guard
+    if(argc<2){ cerr<<"Usage: "<<argv[0]<<" host:port [--text] [--quiet] [--exit-on-complete]\n"; return 1; }
+    bool enableText=false, quiet=false, exitOnComplete=false;
     for(int i=2;i<argc;i++){ string f=argv[i];
-        if(f=="--text") enableText=true; else if(f=="--quiet") quiet=true; else if(f=="--exit-on-complete") exitOnComplete=true; else if(f.rfind("--timeout=",0)==0){ try{ hardTimeoutSec=stoi(f.substr(10)); }catch(...){ hardTimeoutSec=60; } }
+        if(f=="--text") enableText=true; else if(f=="--quiet") quiet=true; else if(f=="--exit-on-complete") exitOnComplete=true;
     }
-    if(const char*ht=getenv("SRV_TIMEOUT_SEC")) { int v=atoi(ht); if(v>0) hardTimeoutSec=v; }
     string host,port; if(!splitAddr(argv[1],host,port)){ cerr<<"Bad host:port\n"; return 1; }
     if(host=="localhost"||host=="ip4-localhost") host="127.0.0.1"; // prefer IPv4
     signal(SIGINT,sigint); initCalcLib();
@@ -40,22 +39,23 @@ int main(int argc,char*argv[]){
     if(sockets.empty()){ cerr<<"bind failed\n"; return 1; }
     if(!quiet) cout<<"udpserver fast on "<<host<<":"<<port<<" text="<<(enableText?"on":"off")<<"\n";
 
-    unordered_map<ClientKey,Task,ClientHash> tasks; uint32_t nextId=1; size_t ok=0, fail=0, issued=0; auto start=Clock::now(); const int TARGET=100; bool idleLogged=false; bool completedLogged=false;
+    unordered_map<ClientKey,Task,ClientHash> tasks; uint32_t nextId=1; size_t ok=0, fail=0, issued=0; auto start=Clock::now(); const int TARGET=100; bool completedLogged=false;
 
     while(g_run){
         fd_set rf; FD_ZERO(&rf); int maxfd=0; for(int s: sockets){ FD_SET(s,&rf); if(s>maxfd) maxfd=s; }
         timeval tv{0,10000}; int sel=select(maxfd+1,&rf,nullptr,nullptr,&tv); if(sel<0){ if(errno==EINTR) continue; perror("select"); break; }
         auto now=Clock::now();
-    // Hard timeout guard
-    if(hardTimeoutSec>0){ auto elapsed=chrono::duration_cast<chrono::seconds>(now - start).count(); if(elapsed >= hardTimeoutSec){ if(!quiet) cerr<<"TIMEOUT_ELAPSED="<<elapsed<<"s (hard limit) exiting\n"; break; } }
-    // Idle watchdog: log once if no tasks issued within 2 seconds
-    if(!idleLogged && issued==0){ auto idleMs=chrono::duration_cast<chrono::milliseconds>(now - start).count(); if(idleMs>2000){ if(!quiet) cout<<"IDLE_WAIT ms="<<idleMs<<" (no handshakes yet)\n"; idleLogged=true; } }
+    // (Removed hard timeout and idle watchdog as per user request)
     // Cleanup: completed >2s or unfinished older than 10s
         for(auto it=tasks.begin(); it!=tasks.end();){ auto age=chrono::duration_cast<chrono::seconds>(now - it->second.created).count(); if( (it->second.done && age>2) || (!it->second.done && age>10) ){ it=tasks.erase(it); } else ++it; }
         if(sel>0){
             for(int s: sockets){ if(!FD_ISSET(s,&rf)) continue; for(int drain=0; drain<512; ++drain){ sockaddr_storage ca{}; socklen_t clen=sizeof(ca); unsigned char buf[128]; ssize_t n=recvfrom(s,buf,sizeof(buf),MSG_DONTWAIT,(sockaddr*)&ca,&clen); if(n<0){ if(errno==EAGAIN||errno==EWOULDBLOCK) break; perror("recvfrom"); break; } if(n==0) break; ClientKey key{ca,clen};
-                // Handshake (allow 12 or truncated 13). Expect client type 22 (binary) or 21 (text)
-                if(n==(ssize_t)sizeof(calcMessage) || n==13){ calcMessage cm{}; memcpy(&cm,buf,sizeof(calcMessage)); uint16_t ctype=ntohs(cm.type); uint16_t maj=ntohs(cm.major_version), min=ntohs(cm.minor_version); if(maj==1 && min==1 && (ctype==21 || ctype==22)){ auto it=tasks.find(key); bool wantText = enableText && ctype==21; if(it==tasks.end()||it->second.done){ Task t=makeTask(nextId++); t.text=wantText; tasks[key]=t; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); ++issued; } else { Task &t=it->second; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); } } continue; }
+                // Handshake: accept calcMessage sized (12) or small variants up to 20 bytes.
+                if(n>=12 && n<=20){ calcMessage cm{}; memcpy(&cm,buf,std::min<size_t>(n,sizeof(calcMessage))); uint16_t ctype=ntohs(cm.type); uint16_t maj=ntohs(cm.major_version), min=ntohs(cm.minor_version); if(maj==1 && min==1 && (ctype==21 || ctype==22)){ // send ACK first (server->client binary ACK = type=2 message=1)
+                        calcMessage ack{}; ack.type=htons(2); ack.message=htonl(1); ack.protocol=htons(17); ack.major_version=htons(1); ack.minor_version=htons(1); sendto(s,&ack,sizeof(ack),0,(sockaddr*)&ca,clen);
+                        auto it=tasks.find(key); bool wantText = enableText && ctype==21; if(it==tasks.end()||it->second.done){ Task t=makeTask(nextId++); t.text=wantText; tasks[key]=t; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); ++issued; } else { Task &t=it->second; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); }
+                    }
+                    continue; }
                 // Binary answer (accept 24..sizeof(calcProtocol)) client->server must have type=2
                 if(n>=(ssize_t)24 && n<=(ssize_t)sizeof(calcProtocol)){ calcProtocol cp{}; memcpy(&cp,buf,std::min<size_t>(n,sizeof(cp))); if(ntohs(cp.major_version)!=1||ntohs(cp.minor_version)!=1) continue; uint16_t ctype=ntohs(cp.type); if(ctype!=2) { continue; } uint32_t id=ntohl(cp.id); int32_t res=ntohl(cp.inResult); auto it=tasks.find(key); if(it==tasks.end()){ if(id==0){ Task t=makeTask(nextId++); tasks[key]=t; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); ++issued; } }
                     else { Task &t=it->second; if(!t.done){ if(id==0){ calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); }
