@@ -371,18 +371,56 @@ int main(int argc, char *argv[]) {
                 }
             }
             
-            // Handle calcMessage sized packets (Test case 2: empty calcMessage)
+            // Handle calcMessage sized packets (potential handshake / ACK / control)
             if (n == (ssize_t)sizeof(calcMessage)) {
-                calcMessage msg;
-                memcpy(&msg, buf, sizeof(calcMessage));
-                // Check if it's all zeros (empty calcMessage from test case 2)
-                if (msg.type == 0 && msg.message == 0 && msg.protocol == 0 && 
+                calcMessage msg_net; memcpy(&msg_net, buf, sizeof(calcMessage));
+                calcMessage msg{};
+                msg.type = ntohs(msg_net.type);
+                msg.message = ntohl(msg_net.message);
+                msg.protocol = ntohs(msg_net.protocol);
+                msg.major_version = ntohs(msg_net.major_version);
+                msg.minor_version = ntohs(msg_net.minor_version);
+
+                // Empty noise packet
+                if (msg.type == 0 && msg.message == 0 && msg.protocol == 0 &&
                     msg.major_version == 0 && msg.minor_version == 0) {
-                    // printf("| Empty calcMessage received (Test case 2). Ignoring gracefully.\n");
                     continue;
                 }
-                // If it's not empty, it might be a text protocol message that happens to be 12 bytes
-                // Let it fall through to text protocol handling
+
+                // Client -> server binary handshake expected = type 22 per protocol.h
+                if (msg.type == 22 && msg.protocol == 17 && msg.major_version == 1 && msg.minor_version == 1) {
+                    if (!client_exists) {
+                        // Create new binary task (similar to new calcProtocol path)
+                        ClientState cs{}; cs.is_binary = true; cs.waiting = true; cs.finished = false; cs.last_ack = 0; cs.timestamp = now;
+                        uint32_t code = (rand() % 4) + 1; int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
+                        int32_t expected = (code == 1) ? (a + b) : (code == 2) ? (a - b) : (code == 3) ? (a * b) : (a / b);
+                        uint32_t id = (uint32_t)(rand() ^ time(NULL));
+                        cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code; clients[key] = cs;
+                        calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1; out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
+                        send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                    } else {
+                        ClientState &cs = it->second;
+                        if (cs.waiting) {
+                            // Re-send same task (duplicate handshake)
+                            calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1; out.id = cs.task_id; out.arith = cs.arith; out.inValue1 = cs.v1; out.inValue2 = cs.v2; out.inResult = 0;
+                            send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                        } else if (cs.finished) {
+                            // Already completed; re-send final ACK as calcMessage
+                            send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, cs.last_ack == 1 ? 1 : 2);
+                        } else {
+                            // Unexpected state -> start fresh task
+                            cs.is_binary = true; cs.waiting = true; cs.finished = false; cs.last_ack = 0; cs.timestamp = now;
+                            uint32_t code = (rand() % 4) + 1; int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
+                            int32_t expected = (code == 1) ? (a + b) : (code == 2) ? (a - b) : (code == 3) ? (a * b) : (a / b);
+                            uint32_t id = (uint32_t)(rand() ^ time(NULL));
+                            cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
+                            calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1; out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
+                            send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                        }
+                    }
+                    continue; // fully handled
+                }
+                // Otherwise fall through to text negotiation or ignore
             }
 
             // Treat as text protocol or mixed protocol
