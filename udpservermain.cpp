@@ -153,6 +153,7 @@ int main(int argc, char *argv[]) {
         return 1; 
     }
     printf("UDP server on %s:%s\n", host, port);
+    fflush(stdout); // Ensure startup line is flushed immediately
 
     std::map<ClientKey, ClientState> clients;
 
@@ -160,9 +161,9 @@ int main(int argc, char *argv[]) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(sockfd, &rfds);
-        struct timeval tv; 
-        tv.tv_sec = 0; 
-        tv.tv_usec = 0; // Non-blocking for maximum performance // Non-blocking for maximum performance
+    struct timeval tv; 
+    tv.tv_sec = 0; 
+    tv.tv_usec = 2000; // 2ms wait to reduce busy spinning under load
         
         int rv = select(sockfd + 1, &rfds, NULL, NULL, &tv);
         time_t now = time(NULL);
@@ -190,7 +191,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (rv <= 0) {
-            usleep(500); // Brief yield when no data (0.01ms)
+            // Timeout with no data ready; loop again after ~2ms
             continue;
         }
         
@@ -272,9 +273,8 @@ int main(int argc, char *argv[]) {
 
 
                 if (is_valid_binary_protocol(cp_host)) {
-                    bool is_answer = (cp_host.type == 2);
                     if (!client_exists) {
-                        if (is_answer) {
+                        if (cp_host.type == 2) {
                             // Can't start with an answer packet
                             continue;
                         }
@@ -323,19 +323,13 @@ int main(int argc, char *argv[]) {
                         ClientState &cs = it->second;
 
                         if (cs.waiting) {
-                            // Awaiting answer for current task
-                            if (!is_answer) {
-                                // Probably a duplicate request -> resend task
-                                calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1;
-                                out.id = cs.task_id; out.arith = cs.arith; out.inValue1 = cs.v1; out.inValue2 = cs.v2; out.inResult = 0;
-                                send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
-                                continue;
-                            }
+                            // Treat any calcProtocol packet (any type) as an answer attempt.
                             if (cp_host.id != cs.task_id) {
                                 // Wrong id -> NOT OK finalize round
                                 send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
                                 cs.waiting = false; cs.finished = true; cs.last_ack = 2; cs.timestamp = now;
                             } else if ((now - cs.timestamp) > 10) {
+                                // Timed out waiting -> NOT OK
                                 send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
                                 cs.waiting = false; cs.finished = true; cs.last_ack = 2; cs.timestamp = now;
                             } else {
@@ -346,8 +340,8 @@ int main(int argc, char *argv[]) {
                             }
                             continue;
                         } else if (cs.finished) {
-                            // Resend prior ACK only; do not start new task
-                            if (is_answer && cp_host.id == cs.task_id) {
+                            // Resend prior ACK only; do not start new task (any type acceptable)
+                            if (cp_host.id == cs.task_id) {
                                 send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, cs.last_ack);
                                 cs.timestamp = now;
                             }
