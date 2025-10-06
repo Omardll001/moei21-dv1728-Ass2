@@ -3,7 +3,7 @@ Target: ::1:5352
 Drop probability: 30%
 Test Results:
 Total: 100
-Successful: 66
-Failed: 34
-Success rate: 66%
+Successful: 70
+Failed: 30
+Success rate: 70%
 SUMMARY: PASSED!
