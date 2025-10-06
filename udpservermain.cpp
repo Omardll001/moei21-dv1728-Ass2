@@ -203,6 +203,7 @@ int main(int argc, char *argv[]) {
                 cp_host.inValue2 = ntohl(cp_net.inValue2);
                 cp_host.inResult = ntohl(cp_net.inResult);
 
+                
                 if (is_valid_binary_protocol(cp_host)) {
                     if (!client_exists) {
                         // New binary client - send task
