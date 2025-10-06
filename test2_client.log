@@ -1,0 +1,9 @@
+Starting 100 concurrent UDP tests...
+Target: localhost:5352
+Drop probability: 30%
+Test Results:
+Total: 100
+Successful: 35
+Failed: 65
+Success rate: 35%
+SUMMARY: FAILED!

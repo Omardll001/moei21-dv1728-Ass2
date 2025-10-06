@@ -100,7 +100,7 @@ int send_calcMessage_udp(int sockfd, const struct sockaddr *to, socklen_t tolen,
 
 bool is_valid_binary_protocol(const calcProtocol &cp) {
     return (cp.major_version == 1 && cp.minor_version == 1) &&
-           (cp.type == 21 || cp.type == 22);
+           (cp.type == 22);  // Accept only binary client-to-server messages
 }
 
 int main(int argc, char *argv[]) {
@@ -192,11 +192,27 @@ int main(int argc, char *argv[]) {
             }
             
             // Handle intermediate malformed sizes (between calcMessage and calcProtocol)
+            // BUT allow text protocol messages to pass through
             if (n > sizeof(calcMessage) && n < sizeof(calcProtocol)) {
-                // Malformed intermediate size - ignore gracefully (no response)
-                printf("| ODD SIZE MESSAGE. Got %d bytes, expected %lu bytes (sizeof(cMessage)) . \n", 
-                       (int)n, sizeof(calcMessage));
-                continue;
+                // Check if this might be a text protocol message
+                std::string potential_text(buf, min((size_t)n, (size_t)50)); // Check first 50 chars
+                bool looks_like_text = true;
+                
+                // Text protocol messages should contain printable ASCII characters
+                for (char c : potential_text) {
+                    if (!isprint(c) && c != '\n' && c != '\r' && c != '\t') {
+                        looks_like_text = false;
+                        break;
+                    }
+                }
+                
+                if (!looks_like_text) {
+                    // Malformed binary intermediate size - ignore gracefully (no response)
+                    printf("| ODD SIZE MESSAGE. Got %d bytes, expected %lu bytes (sizeof(cMessage)) . \n", 
+                           (int)n, sizeof(calcMessage));
+                    continue;
+                }
+                // If it looks like text, let it fall through to text protocol handling
             }
             
             // Handle oversized malformed messages (larger than calcProtocol)
@@ -352,9 +368,8 @@ int main(int argc, char *argv[]) {
 
             if (!client_exists) {
                 // Check if this is protocol negotiation that expects binary response
-                bool expect_binary_response = (s.find("TEXT UDP") != std::string::npos ||
-                                               s.find("BINARY UDP") != std::string::npos ||
-                                               n <= 15); // Short messages likely protocol negotiation
+                bool expect_binary_response = (s.find("BINARY UDP") != std::string::npos ||
+                                               (n <= 15 && s.find("TEXT UDP") == std::string::npos)); // Short messages likely binary protocol negotiation, unless they're TEXT UDP
                 
                 // New client - send task
                 uint32_t code = (rand() % 4) + 1;
