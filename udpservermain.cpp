@@ -160,14 +160,14 @@ int main(int argc, char *argv[]) {
         FD_SET(sockfd, &rfds);
         struct timeval tv; 
         tv.tv_sec = 0; 
-        tv.tv_usec = 100; // 0.1ms timeout for high performance
+        tv.tv_usec = 0; // Non-blocking for maximum performance
         
         int rv = select(sockfd + 1, &rfds, NULL, NULL, &tv);
         time_t now = time(NULL);
         
-        // Cleanup stale clients (>10s waiting) - only every 1000 iterations for performance
+        // Cleanup stale clients - only every 10000 iterations for maximum performance
         static int cleanup_counter = 0;
-        if (++cleanup_counter >= 1000) {
+        if (++cleanup_counter >= 10000) {
             cleanup_counter = 0;
             std::vector<ClientKey> to_delete;
             for (auto &p : clients) {
@@ -180,7 +180,10 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (rv <= 0) continue;
+        if (rv <= 0) {
+            usleep(10); // Brief yield when no data (0.01ms)
+            continue;
+        }
         
         if (FD_ISSET(sockfd, &rfds)) {
             char buf[1024];
