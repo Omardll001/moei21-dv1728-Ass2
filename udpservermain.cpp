@@ -67,7 +67,7 @@ int setup_socket(const char *host, const char *port) {
         if (fd == -1) continue;
         
         // Optimize socket buffers for high concurrency
-        int buffer_size = 1024 * 1024; // 1MB buffers
+        int buffer_size = 4 * 1024 * 1024; // 4MB buffers
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
         
@@ -160,7 +160,7 @@ int main(int argc, char *argv[]) {
         FD_SET(sockfd, &rfds);
         struct timeval tv; 
         tv.tv_sec = 0; 
-        tv.tv_usec = 0; // Non-blocking for maximum performance
+        tv.tv_usec = 5000; // Non-blocking for maximum performance
         
         int rv = select(sockfd + 1, &rfds, NULL, NULL, &tv);
         time_t now = time(NULL);
@@ -181,7 +181,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (rv <= 0) {
-            usleep(10); // Brief yield when no data (0.01ms)
+            usleep(500); // Brief yield when no data (0.01ms)
             continue;
         }
         
