@@ -137,30 +137,32 @@ int main(int argc,char*argv[]){
                 auto it=tasks.find(key);
                 uint32_t idNet=ntohl(cp.id);
                 int32_t inRes=ntohl(cp.inResult);
+                bool allZero = true; for(size_t zi=0; zi<sizeof(cp); ++zi){ if(reinterpret_cast<unsigned char*>(&cp)[zi]!=0){ allZero=false; break; } }
                 // NEW logic:
-                //  * A (new) request MUST have id==0 (ignore inResult which may be 0 for valid answers later)
-                //  * An answer has id==task.id and may have inRes == 0 (e.g., sub where v1==v2, or div result 0)
+                //  * Accept ANY first calcProtocol (except malformed all-zero) as a request and issue task (improves resilience if client skips id==0 convention)
+                //  * An answer has id==task.id
                 if(it==tasks.end()){
-                    if(idNet==0){
+                    if(allZero){
+                        // Malformed empty packet -> NOT OK once
+                        calcMessage msg{}; msg.type=htons(2); msg.message=htonl(2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
+                        if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-empty"); ++answers_fail; 
+                    } else {
                         TaskInfo t=makeTask(nextId++); t.isText=false; tasks[key]=t;
                         calcProtocol out{}; out.type=htons(1); // server->client
                         out.major_version=htons(1); out.minor_version=htons(1);
                         out.id=htonl(t.id); out.arith=htonl(t.arith);
                         out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                         if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-task"); else ++tasks_issued;
-                    } else {
-                        // Unknown task id: reject so client can stop
-                        calcMessage msg{}; msg.type=htons(2); msg.message=htonl(2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
-                        if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-reject"); ++answers_fail;
                     }
                 } else {
                     TaskInfo &t=it->second;
-                    if(idNet==0){
-                        // Client re-request (lost task?) -> resend original task
-                        calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
-                        out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
-                        if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-resend"); else ++resend_task;
-                    } else if(idNet==t.id){
+                    if(idNet==0 || idNet==t.id){
+                        if(!t.done && idNet==0){
+                            // resend request
+                            calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
+                            out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
+                            if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-resend"); else ++resend_task;
+                        } else if(idNet==t.id){
                         // Treat ANY inRes (including 0) as final answer
                         auto age=chrono::duration_cast<chrono::seconds>(now - t.ts).count();
                         int32_t real=eval(t);
@@ -169,9 +171,9 @@ int main(int argc,char*argv[]){
                         if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-answer");
                         if(ok) ++answers_ok; else ++answers_fail;
                         t.done=true; t.finished=Clock::now(); t.lastOk=ok;
+                        }
                     } else {
-                        // Different id (stale/late) -> silently ignore to avoid counting as failure.
-                        // Intentionally no NOT OK response here.
+                        // Different unexpected id: ignore
                     }
                 }
                 } else { // treat as TEXT

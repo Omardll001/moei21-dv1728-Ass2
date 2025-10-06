@@ -1,2 +1,2 @@
 udpserver running on ::1:5352 sockets=1
-DIAG pkts=1 bin=0 txt=1 tasks=1 resend=0 ok=0 fail=0 reack=0 outstanding=1
+DIAG pkts=1 bin=1 txt=0 tasks=1 resend=0 ok=0 fail=0 reack=0 outstanding=1
