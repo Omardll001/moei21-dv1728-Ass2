@@ -118,6 +118,17 @@ int main(int argc,char*argv[]){
                 if(n<0) break;
                 ++pkt_recv;
                 ClientKey key; key.addr=caddr; key.len=clen;
+                // Fast drop malformed sizes (not calcMessage=12, not calcProtocol=sizeof(calcProtocol), and text not enabled)
+                if(!enableText && (size_t)n!=sizeof(calcMessage) && (size_t)n!=sizeof(calcProtocol)){
+                    if(debug) cout<<"EV DROP size="<<n<<" addr="<<addrToString(caddr)<<"\n"; 
+                    continue;
+                }
+                if(enableText){
+                    // If enabled text, still drop obviously invalid tiny/huge packets (1..3 or >128) to avoid wasting cycles
+                    if((size_t)n!=sizeof(calcMessage) && (size_t)n!=sizeof(calcProtocol)){
+                        if(n<5 || n>200){ if(debug) cout<<"EV DROP size(text-mode)="<<n<<" addr="<<addrToString(caddr)<<"\n"; continue; }
+                    }
+                }
                 // (Optional) calcMessage handshake: treat as 'new request' when no task or re-ACK when done
                 if((size_t)n == sizeof(calcMessage)) {
                     calcMessage cm{}; memcpy(&cm,buf,sizeof(cm));
@@ -273,7 +284,11 @@ int main(int argc,char*argv[]){
             TaskInfo &t = kv.second; if(t.done) continue; auto ms=chrono::duration_cast<chrono::milliseconds>(nowPR - t.lastSend).count();
             auto ageS = chrono::duration_cast<chrono::seconds>(nowPR - t.ts).count();
             if(ageS>=10) continue; // nearing cleanup
-            if(ms>=400){
+            // Adaptive interval: fast early (250ms) then 400ms, with small deterministic jitter to de-sync bursts
+            int base = (t.resendCount < 5 ? 250 : 400);
+            int jitter = ((int)t.id * 31 + t.resendCount * 17) % 40; // 0..39ms
+            int target = base + jitter;
+            if(ms>=target){
                 int useSock = (t.sockfd>=0)? t.sockfd : (socks.empty()? -1 : socks[0]);
                 if(useSock<0) continue;
                 const sockaddr_storage &caddr = kv.first.addr; socklen_t clen = kv.first.len;
@@ -291,6 +306,12 @@ int main(int argc,char*argv[]){
             // Always send DIAG to stdout so CodeGrade captures it in server.log
             if(debug) {
                 cout << "DIAG pkts="<<pkt_recv<<" bin="<<pkt_binary<<" txt="<<pkt_text<<" tasks="<<tasks_issued<<" resend="<<resend_task<<" ok="<<answers_ok<<" fail="<<answers_fail<<" reack="<<reack<<" outstanding="<<tasks.size()<<"\n";
+                // Pending summary (up to 12 tasks) id(ageS,resend)
+                if(!tasks.empty()){
+                    int shown=0; cout<<"PEND ";
+                    for(auto &kv:tasks){ if(shown>=12) break; const TaskInfo &t=kv.second; if(t.done) continue; auto ageS=chrono::duration_cast<chrono::milliseconds>(now2 - t.ts).count()/1000.0; cout<<t.id<<"("<<ageS<<"s,r="<<t.resendCount<<") "; ++shown; }
+                    cout<<"\n";
+                }
             } else {
                 cout << "DIAG pkts="<<pkt_recv<<" tasks="<<tasks_issued<<" ok="<<answers_ok<<" fail="<<answers_fail<<" out="<<tasks.size()<<"\n";
             }
