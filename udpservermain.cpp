@@ -182,7 +182,7 @@ int main(int argc, char *argv[]) {
                 continue;
             }
             
-            // Handle error test case 3: very small messages (like 4 bytes from ptu test case 3)
+            // Handle very small messages (test case 3) gracefully
             if (n < 8 && n != sizeof(calcProtocol) && n != sizeof(calcMessage)) {
                 // Test case 3: Small incorrect size message - ignore gracefully
                 printf("| ODD SIZE MESSAGE. Got %d bytes, expected %lu bytes (sizeof(cMessage)) . \n", 

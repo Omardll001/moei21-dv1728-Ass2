@@ -1,0 +1,4 @@
+UDP server on ip4-localhost:5352
+| ODD SIZE MESSAGE. Got 4 bytes, expected 12 bytes (sizeof(cMessage)) . 
+| Empty calcMessage received (Test case 2). Ignoring gracefully.
+| Invalid binary protocol message (size: 26). Ignoring gracefully.
