@@ -19,6 +19,10 @@
 #include <string>
 #include <algorithm>
 #include <math.h> 
+#include <poll.h>
+#include <vector>
+#include <string>
+
 
 
 #include "protocol.h"
@@ -353,11 +357,6 @@ void handle_text_client(int fd) {
     close(fd);
 }
 
-#include <poll.h>
-#include <vector>
-#include <string>
-#include <algorithm>
-
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s host:port\n", argv[0]);
@@ -369,18 +368,18 @@ int main(int argc, char *argv[]) {
     // Parse host:port
     char *input = argv[1];
     char *sep = strchr(input, ':');
-    if (!sep) {
-        fprintf(stderr, "Error: input must be host:port\n");
-        return 1;
+    if (!sep) { 
+        fprintf(stderr, "Error: input must be host:port\n"); 
+        return 1; 
     }
-    char host[256];
+    char host[256]; 
     char port[64];
     size_t hostlen = sep - input;
-    if (hostlen >= sizeof(host)) {
-        fprintf(stderr, "hostname too long\n");
-        return 1;
+    if (hostlen >= sizeof(host)) { 
+        fprintf(stderr, "hostname too long\n"); 
+        return 1; 
     }
-    strncpy(host, input, hostlen);
+    strncpy(host, input, hostlen); 
     host[hostlen] = '\0';
 
     // Parse port after colon, digits only
@@ -396,9 +395,9 @@ int main(int argc, char *argv[]) {
     port[portlen] = '\0';
 
     int listenfd = setup_listener(host, port);
-    if (listenfd < 0) {
-        perror("setup_listener");
-        return 1;
+    if (listenfd < 0) { 
+        perror("setup_listener"); 
+        return 1; 
     }
     fprintf(stderr, "TCP server on %s:%s\n", host, port);
 
@@ -413,14 +412,13 @@ int main(int argc, char *argv[]) {
             perror("accept");
             continue;
         }
-
+        
         pid_t pid = fork();
         if (pid < 0) {
             perror("fork");
             close(connfd);
             continue;
         } else if (pid == 0) {
-            // child
             close(listenfd);
 
             const size_t MAX_PEEK = std::max(sizeof(calcProtocol), (size_t)128);
@@ -438,27 +436,29 @@ int main(int argc, char *argv[]) {
                 _exit(1);
             }
             if (pol == 0) {
-                // no data now -> assume TEXT, send greeting immediately in handler
-                fprintf(stderr, "protocol-detect: no data on connect -> assuming TEXT\n");
+                // No data immediately available -> assume TEXT (greet immediately)
+                fprintf(stderr, "protocol-detect: no data -> TEXT\n");
                 handle_text_client(connfd);
                 _exit(0);
             }
 
+            // Data available now; ensure readable
             if (!(pfd.revents & POLLIN)) {
-                fprintf(stderr, "protocol-detect: unexpected poll revents=0x%x\n", pfd.revents);
+                fprintf(stderr, "protocol-detect: poll revents unexpected=0x%x\n", pfd.revents);
                 close(connfd);
                 _exit(1);
             }
 
-            // Data available: peek
+            // Peek up to MAX_PEEK bytes (will not block since poll told us data is ready)
             ssize_t r = recv(connfd, peekbuf.data(), (int)peekbuf.size(), MSG_PEEK);
             if (r <= 0) {
+                // client closed or error
                 close(connfd);
                 _exit(0);
             }
             size_t got = (size_t) r;
 
-            // 1 If peek contains newline within printable ASCII -> may be text instruction.
+            // If peek contains a newline and looks printable ASCII, treat it as an instruction line
             bool looks_text = false;
             for (size_t i = 0; i < got; ++i) {
                 unsigned char c = static_cast<unsigned char>(peekbuf[i]);
@@ -467,36 +467,29 @@ int main(int argc, char *argv[]) {
             }
 
             if (looks_text) {
-                // Build string of the peeked bytes (may be a partial line)
-                std::string peekstr(peekbuf.data(), peekbuf.data() + got);
-                // case-insensitive search for the token "binary"
-                std::string lower = peekstr;
-                std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c){ return std::tolower(c); });
+                std::string s(peekbuf.data(), peekbuf.data() + got);
+                std::string lower = s;
+                std::transform(lower.begin(), lower.end(), lower.begin(), (int(*)(int))std::tolower);
 
                 if (lower.find("binary") != std::string::npos) {
-                    // Client indicates it wants binary mode.
-                    // Consume the initial text line from the socket so it won't remain for the binary handler.
-                    // Read until newline (or until no more data).
-                    std::string consumed;
+                    // consume the initial ASCII line up to and including newline
                     char ch;
-                    ssize_t rn;
-                    while ((rn = recv(connfd, &ch, 1, 0)) == 1) {
-                        consumed.push_back(ch);
+                    while (1) {
+                        ssize_t rn = recv(connfd, &ch, 1, 0);
+                        if (rn <= 0) break;
                         if (ch == '\n') break;
                     }
-                    // Now switch to binary handler
-                    fprintf(stderr, "protocol-detect: text instruction requested BINARY -> switching to binary\n");
+                    fprintf(stderr, "protocol-detect: instruction requested BINARY -> switch to binary\n");
                     handle_binary_client(connfd);
                     _exit(0);
                 } else {
-                    // Plain text client -> handle text
-                    fprintf(stderr, "protocol-detect: peek looks like TEXT (no binary token)\n");
+                    fprintf(stderr, "protocol-detect: ASCII instruction NOT binary -> TEXT\n");
                     handle_text_client(connfd);
                     _exit(0);
                 }
             }
 
-            // 2 If we have a full calcProtocol header, validate it safely
+            // Not plaintext: check for a full binary header
             bool is_binary = false;
             if (got >= sizeof(calcProtocol)) {
                 calcProtocol tmp;
@@ -509,20 +502,17 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            // 3 Undecided or partial -> default to TEXT (don't delay greeting)
-            if (!is_binary) {
-                fprintf(stderr, "protocol-detect: undecided (partial/unknown) -> defaulting to TEXT\n");
+            if (is_binary) {
+                fprintf(stderr, "protocol-detect: validated BINARY header\n");
+                handle_binary_client(connfd);
+                _exit(0);
+            } else {
+                // undecided or partial header -> default to TEXT (do not delay greeting)
+                fprintf(stderr, "protocol-detect: undecided/partial -> default TEXT\n");
                 handle_text_client(connfd);
                 _exit(0);
             }
-
-            // 4 Validated binary header
-            fprintf(stderr, "protocol-detect: validated BINARY header\n");
-            handle_binary_client(connfd);
-            _exit(0);
-
         } else {
-            // parent
             close(connfd);
             while (waitpid(-1, NULL, WNOHANG) > 0) {}
         }
