@@ -1,0 +1,145 @@
+server=ip4-localhost
+serverport=5352;
+tests=100
+drop_prob=30
+
+echo "Date:" $(date)
+echo "Starting your server on $server:$serverport"
+unbuffer ./udpserver ${server}:$serverport &> server.log 2>server_err.log &
+SERVER_PID=$!    
+echo "Sleep abit."
+sleep 1
+echo "server on " $(lsof -i:$serverport  | grep server)
+
+
+serverStatus=$(lsof -i:$serverport | grep server)
+if [[ $serverStatus == *"IPv4"* ]]; then
+    echo "Looks good, you got a IPv4 Socket"
+else
+    echo "Strange, you should have a IPv4 Socket for your server."
+    echo "You have $serverStatus ."
+    echo "I'll kill the server, and print any log it generated."
+    kill $SERVER_PID
+    killall server
+    sleep 1
+    echo "This was the log"
+    cat server.log
+    echo "<end of log>"
+    exit 1
+fi
+
+echo "PID = $SERVER_PID ??" 
+echo "Checking server.log"
+cat server.log 
+
+
+SRV_PID=$(lsof -i:$serverport | grep server | awk '{print $2}')
+
+echo "Check that server started, SRV_PID = $SRV_PID ".
+
+if [ ! -f "server.log" ]; then
+    echo "Server.log was not created, problems. " 
+    echo "killing server as a safety. " 
+    killall server
+    echo "Make sure that your server does _some_ print out, its enough to state that is running."
+    exit 1
+fi
+   
+
+if [ -z "$SRV_PID" ]; then
+    echo "There does not seem to be a server running on $serverport."
+    echo "Server Evaluation: Serverfailed, did not start " 
+    lsof -i:$serverport 
+    echo "server.log=> " $(cat server.log) " EOL"
+    echo "Logging server as failed. " 
+    killall server
+    exit 1
+fi
+
+echo "Test 1"
+
+gitString=$(cat myGitdata.h  | grep 'commit' | awk -F'=' '{print $2}' | sed 's/\"commit //g' | tr -d '\"; ')
+randValue=$(echo "$RANDOM")
+
+echo "Gitdata: $gitString"
+echo "randValue: $randValue"
+
+
+echo "Normal scenario"
+data=$(./ptu ${server}:$serverport )
+sumLine=$(echo "$data" | grep 'SUMMARY')
+
+if [[ -z "$sumLine" ]]; then
+    echo "Problems; did you crash the test client?"
+    echo "--------"
+    echo "$data"
+    echo "--------"
+    exit 1
+else 
+    echo "Server repy was Ok, got this."
+    echo "--------"
+    echo "$data"
+    echo "--------"
+
+fi
+
+
+
+declare -A tests
+
+tests["1"]="Sending an empty calcProtocol, should generate an error."
+tests["2"]="Sending an empty calcMessage, should generate an error."
+tests["3"]="Sending an message of incorrect size, should generate an error."
+
+
+
+for testid in "${!tests[@]}"; do 
+    if [[ "$testid" == "0" ]]; then
+        continue
+    fi
+
+    echo "Starting $testid, " ${tests[$testid]} "."
+    data=$(./ptu ${server}:$serverport $testid "$randValue" )
+
+    sumLine=$(echo "$data" | grep 'SUMMARY')
+
+    if [[ -z "$sumLine" ]]; then
+        echo "Problems; did you crash the test client?"
+        echo "--------"
+        echo "$data"
+        echo "--------"
+        exit 1
+    fi
+
+    T1status=$(echo "$sumLine" | awk -F'|' '{print $2}' | tr -d ' ')
+    T1gitstr=$(echo "$sumLine" | awk -F'|' '{print $3}' | sed 's/commit//g' | tr -d ' ')
+    T1randstr=$(echo "$sumLine" | awk -F'|' '{print $4}' | tr -d ' ')
+
+    if [[ "$T1status" != "OK" ]]; then
+        echo "There was a problem"
+        echo "--------"
+        echo "$data"
+        echo "--------"
+        exit 1
+    fi
+
+    if [[ "$T1gitstr" != "$gitString" ]]; then
+        echo "There was a problem, we did not get the expected key string ($gitString) in our output ($T1gitstr)"
+        echo "This string changes. "
+        echo "--------"
+        echo "$data"
+        echo "--------"
+        exit 1
+    fi
+
+    if [[ "$T1randstr" != "$randValue" ]]; then
+        echo "There was a problem, we did not get the expected random string in our output"
+        echo "This string changes. "
+        echo "--------"
+        echo "$data"
+        echo "--------"
+        exit 1
+    fi
+
+    echo "Successfully completed $testid. "
+done    
