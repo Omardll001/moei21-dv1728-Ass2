@@ -25,6 +25,7 @@ static int32_t eval(const Task&t){ switch(t.op){case 1:return t.v1+t.v2; case 2:
 static bool splitAddr(const string&s,string&h,string&p){ auto pos=s.rfind(':'); if(pos==string::npos) return false; h=s.substr(0,pos); p=s.substr(pos+1); return !h.empty() && !p.empty(); }
 
 int main(int argc,char*argv[]){
+    std::cout.setf(std::ios::unitbuf);
     if(argc<2){ cerr<<"Usage: "<<argv[0]<<" host:port [--text] [--quiet] [--exit-on-complete]\n"; return 1; }
     bool enableText=false, quiet=false, exitOnComplete=false;
     for(int i=2;i<argc;i++){ string f=argv[i];
@@ -63,18 +64,27 @@ int main(int argc,char*argv[]){
                 // Handshake path: client sends calcMessage (12 bytes) type 21 (text) or 22 (binary)
                 if(n==sizeof(calcMessage) || n==13){ calcMessage cm{}; memcpy(&cm,buf,sizeof(cm)); uint16_t ctype=ntohs(cm.type); uint16_t maj=ntohs(cm.major_version), min=ntohs(cm.minor_version); if(maj==1 && min==1 && (ctype==21 || ctype==22)){
                         bool wantText = enableText && ctype==21;
+                        // If unknown address, attempt IP-only match to existing pending task (port migration)
+                        if(existingAddr==clientToId.end()){
+                            for(auto &kv: idTasks){ Task &pt=kv.second.task; if(pt.done) continue; bool ipMatch=false; if(ca.ss_family==kv.second.addr.ss_family){ if(ca.ss_family==AF_INET){ auto*A=(sockaddr_in*)&ca; auto*B=(sockaddr_in*)&kv.second.addr; ipMatch = (A->sin_addr.s_addr==B->sin_addr.s_addr); } else { auto*A=(sockaddr_in6*)&ca; auto*B=(sockaddr_in6*)&kv.second.addr; ipMatch = memcmp(&A->sin6_addr,&B->sin6_addr,sizeof(in6_addr))==0; } }
+                                if(ipMatch){ clientToId[key]=kv.first; kv.second.addr=ca; kv.second.len=clen; existingAddr=clientToId.find(key); break; }
+                            }
+                        }
                         // For binary clients (22) DO NOT send 12-byte ACK (client expects first reply = calcProtocol)
                         // For text clients (21) send a text line directly (optionally could ACK first, but skip to save RTT)
-                        if(existingAddr==clientToId.end() || idTasks[existingAddr->second].task.done){ Task t=makeTask(nextId++); t.text=wantText; TaskRec rec{t,ca,clen,(int)si}; idTasks[t.id]=rec; clientToId[key]=t.id; if(wantText){ string line=to_string(t.id)+" "+(t.op==1?"add":t.op==2?"sub":t.op==3?"mul":"div")+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n"; sendto(s,line.c_str(),line.size(),0,(sockaddr*)&ca,clen); }
+                        if(existingAddr==clientToId.end() || idTasks[existingAddr->second].task.done){ Task t=makeTask(nextId++); t.text=wantText; TaskRec rec{t,ca,clen,(int)si}; idTasks[t.id]=rec; clientToId[key]=t.id; if(!quiet){ cout<<"TASK id="<<t.id<<" op="<<t.op<<" v1="<<t.v1<<" v2="<<t.v2<<"\n"; } if(wantText){ string line=to_string(t.id)+" "+(t.op==1?"add":t.op==2?"sub":t.op==3?"mul":"div")+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n"; sendto(s,line.c_str(),line.size(),0,(sockaddr*)&ca,clen); }
                             else { calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); }
                             ++issued; }
                         else { TaskRec &rec=idTasks[ existingAddr->second ]; Task &t=rec.task; if(wantText){ string line=to_string(t.id)+" "+(t.op==1?"add":t.op==2?"sub":t.op==3?"mul":"div")+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n"; sendto(s,line.c_str(),line.size(),0,(sockaddr*)&ca,clen); }
                             else { calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); } }
                         continue; }
                 }
-                // If new client sends calcProtocol directly with id=0 treat as implicit handshake
+                // If new client sends calcProtocol directly: only implicit handshake if id==0 and (type==0 or type==2)
                 if(existingAddr==clientToId.end() && n>=(ssize_t)24 && n<=(ssize_t)sizeof(calcProtocol)){
-                    calcProtocol cp{}; memcpy(&cp,buf,std::min<size_t>(n,sizeof(cp))); if(ntohs(cp.major_version)==1 && ntohs(cp.minor_version)==1){ uint16_t ttype=ntohs(cp.type); if(ttype==2 || ttype==0){ Task t=makeTask(nextId++); TaskRec rec{t,ca,clen,(int)si}; idTasks[t.id]=rec; clientToId[key]=t.id; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); ++issued; continue; } }
+                    calcProtocol cp{}; memcpy(&cp,buf,std::min<size_t>(n,sizeof(cp))); if(ntohs(cp.major_version)==1 && ntohs(cp.minor_version)==1){ uint16_t ttype=ntohs(cp.type); uint32_t cid=ntohl(cp.id); if(cid==0 && (ttype==0 || ttype==2)){ Task t=makeTask(nextId++); TaskRec rec{t,ca,clen,(int)si}; idTasks[t.id]=rec; clientToId[key]=t.id; if(!quiet){ cout<<"TASK id="<<t.id<<" op="<<t.op<<" v1="<<t.v1<<" v2="<<t.v2<<" (implicit)\n"; } calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); ++issued; continue; } else if(ttype==2 && cid>0){ // answer from address we haven't mapped yet: attach mapping and fall through to answer handler below
+                            auto itExisting=idTasks.find(cid); if(itExisting!=idTasks.end()){ clientToId[key]=cid; }
+                        }
+                    }
                 }
                 // Legacy re-send for existing client handshake-size packet
                 if(existingAddr!=clientToId.end() && n>=12 && n<=20){ TaskRec &rec=idTasks[ existingAddr->second ]; Task &t=rec.task; // do NOT create new task here; just resend existing if not done
@@ -97,9 +107,9 @@ int main(int argc,char*argv[]){
             }}
         }
     // Simple proactive resend (lightweight) using idTasks
-    auto now2=Clock::now(); for(auto &kv:idTasks){ Task &t=kv.second.task; if(t.done) continue; auto ms=chrono::duration_cast<chrono::milliseconds>(now2 - t.lastSend).count(); if(ms < 80) continue; int target=(t.resend<2?80:(t.resend<5?140:220)); if(t.resend>=5) target=300; if(t.resend>=8) target=450; if(ms>=target){ if(kv.second.sockIdx>=0 && kv.second.sockIdx < (int)sockets.size()){ int outSock=sockets[kv.second.sockIdx]; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(outSock,&out,sizeof(out),0,(sockaddr*)&kv.second.addr,kv.second.len); t.lastSend=now2; ++t.resend; } }
+    auto now2=Clock::now(); for(auto &kv:idTasks){ Task &t=kv.second.task; if(t.done) continue; auto ms=chrono::duration_cast<chrono::milliseconds>(now2 - t.lastSend).count(); if(ms < 40) continue; int target=(t.resend<2?60:(t.resend<5?120:200)); if(t.resend>=5) target=260; if(t.resend>=8) target=380; if(ms>=target){ if(kv.second.sockIdx>=0 && kv.second.sockIdx < (int)sockets.size()){ int outSock=sockets[kv.second.sockIdx]; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(outSock,&out,sizeof(out),0,(sockaddr*)&kv.second.addr,kv.second.len); if(!quiet && (t.resend==3 || t.resend==6 || t.resend==9)) cout<<"RSDBG id="<<t.id<<" r="<<t.resend<<" ms="<<ms<<"\n"; t.lastSend=now2; ++t.resend; } }
     }
-    if(!quiet){ static auto lastPrint=start; if(chrono::duration_cast<chrono::milliseconds>(Clock::now()-lastPrint).count()>=1000){ size_t pending=0; for(auto &kv:idTasks) if(!kv.second.task.done) ++pending; auto elapsedMs=chrono::duration_cast<chrono::milliseconds>(Clock::now()-start).count(); cout<<"DIAG tasks="<<issued<<" ok="<<ok<<" fail="<<fail<<" pend="<<pending<<" elapsedMs="<<elapsedMs<<"\n"; lastPrint=Clock::now(); } }
+    if(!quiet){ static auto lastPrint=start; static auto lastDump=start; auto elapsedNow=Clock::now(); if(chrono::duration_cast<chrono::milliseconds>(elapsedNow-lastPrint).count()>=1000){ size_t pending=0; for(auto &kv:idTasks) if(!kv.second.task.done) ++pending; auto elapsedMs=chrono::duration_cast<chrono::milliseconds>(elapsedNow-start).count(); cout<<"DIAG tasks="<<issued<<" ok="<<ok<<" fail="<<fail<<" pend="<<pending<<" elapsedMs="<<elapsedMs<<"\n"; lastPrint=elapsedNow; if(pending>0 && elapsedMs>10000 && chrono::duration_cast<chrono::milliseconds>(elapsedNow-lastDump).count()>=2000){ cout<<"PENDING_IDS="; for(auto &kv:idTasks){ if(!kv.second.task.done) cout<<kv.first<<","; } cout<<"\n"; lastDump=elapsedNow; } } }
         // Keep running; do NOT exit automatically after target to stay serviceable.
     }
     for(int s: sockets) close(s);
