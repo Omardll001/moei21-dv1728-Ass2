@@ -36,8 +36,13 @@ int main(int argc,char*argv[]){
     // Bind single (IPv4 preferred); if user gave IPv6 explicit, attempt that.
     vector<int> sockets; auto bindOne=[&](const string&H){ struct addrinfo hints{}; hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_DGRAM; hints.ai_flags=AI_PASSIVE; struct addrinfo*res=nullptr; if(getaddrinfo(H.c_str(),port.c_str(),&hints,&res)!=0) return; for(auto*p=res;p;p=p->ai_next){ int s=socket(p->ai_family,p->ai_socktype,p->ai_protocol); if(s<0) continue; int yes=1; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes)); if(p->ai_family==AF_INET6){ int off=0; setsockopt(s,IPPROTO_IPV6,IPV6_V6ONLY,&off,sizeof(off)); } if(bind(s,p->ai_addr,p->ai_addrlen)==0){ sockets.push_back(s); break; } close(s);} freeaddrinfo(res); };
     bindOne(host);
+    // Attempt additional wildcard binds to catch clients resolving differently.
+    auto haveFam=[&](int fam){ for(int s: sockets){ sockaddr_storage ss{}; socklen_t sl=sizeof(ss); if(getsockname(s,(sockaddr*)&ss,&sl)==0 && ss.ss_family==fam) return true; } return false; };
+    if(!haveFam(AF_INET)) bindOne("0.0.0.0"); // wildcard IPv4
+    if(!haveFam(AF_INET6)) bindOne("::");      // wildcard IPv6
+    if(host=="127.0.0.1" && !haveFam(AF_INET6)){ bindOne("::1"); }
     if(sockets.empty()){ cerr<<"bind failed\n"; return 1; }
-    if(!quiet) cout<<"udpserver fast on "<<host<<":"<<port<<" text="<<(enableText?"on":"off")<<"\n";
+    if(!quiet){ cout<<"udpserver fast on "<<host<<":"<<port<<" text="<<(enableText?"on":"off")<<"\n"; cout<<"SOCKETS bound="<<sockets.size(); for(int s:sockets){ sockaddr_storage ss{}; socklen_t sl=sizeof(ss); if(getsockname(s,(sockaddr*)&ss,&sl)==0){ if(ss.ss_family==AF_INET) cout<<" [IPv4]"; else if(ss.ss_family==AF_INET6) cout<<" [IPv6]"; } } cout<<"\n"; }
 
     unordered_map<ClientKey,Task,ClientHash> tasks; uint32_t nextId=1; size_t ok=0, fail=0, issued=0; auto start=Clock::now(); const int TARGET=100; bool completedLogged=false;
 
@@ -50,14 +55,25 @@ int main(int argc,char*argv[]){
         for(auto it=tasks.begin(); it!=tasks.end();){ auto age=chrono::duration_cast<chrono::seconds>(now - it->second.created).count(); if( (it->second.done && age>2) || (!it->second.done && age>10) ){ it=tasks.erase(it); } else ++it; }
         if(sel>0){
             for(int s: sockets){ if(!FD_ISSET(s,&rf)) continue; for(int drain=0; drain<512; ++drain){ sockaddr_storage ca{}; socklen_t clen=sizeof(ca); unsigned char buf[128]; ssize_t n=recvfrom(s,buf,sizeof(buf),MSG_DONTWAIT,(sockaddr*)&ca,&clen); if(n<0){ if(errno==EAGAIN||errno==EWOULDBLOCK) break; perror("recvfrom"); break; } if(n==0) break; ClientKey key{ca,clen};
-                // First-packet fast path: if this is a new client and we have no task, issue one immediately (ignore handshake specifics for speed)
-                static int rawDebugCount=0; if(rawDebugCount<10){ cout<<"RAW len="<<n<<" first="<<(int)buf[0]<<" second="<<( (n>1)?(int)buf[1]:-1 )<<"\n"; ++rawDebugCount; }
+                // Packet debug (first 15 packets overall)
+                static int rawDebugCount=0; if(rawDebugCount<15){ cout<<"RAW len="<<n; if(n>=2) cout<<" b0="<<(int)buf[0]<<" b1="<<(int)buf[1]; cout<<"\n"; ++rawDebugCount; }
                 auto existing = tasks.find(key);
-                if(existing==tasks.end()){
-                    Task t=makeTask(nextId++); t.text=false; tasks[key]=t; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); ++issued; continue; }
-                // (If not new, fall through to other classifiers)
-                // Legacy handshake acceptance retained but without ACK; still allow 12-20 sized packets to trigger re-send of existing task.
-                if(n>=12 && n<=20){ calcMessage cm{}; memcpy(&cm,buf,std::min<size_t>(n,sizeof(calcMessage))); uint16_t ctype=ntohs(cm.type); uint16_t maj=ntohs(cm.major_version), min=ntohs(cm.minor_version); if(maj==1 && min==1 && (ctype==21 || ctype==22)){ Task &t=existing->second; if(t.done){ Task nt=makeTask(nextId++); tasks[key]=nt; t=nt; } calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); } continue; }
+                // Handshake path: calcMessage size 12 (or 13) from client types 21/22
+                if(n==sizeof(calcMessage) || n==13){ calcMessage cm{}; memcpy(&cm,buf,sizeof(cm)); uint16_t ctype=ntohs(cm.type); uint16_t maj=ntohs(cm.major_version), min=ntohs(cm.minor_version); if(maj==1 && min==1 && (ctype==21 || ctype==22)){
+                        // ACK
+                        calcMessage ack{}; ack.type=htons( (ctype==21)?1:2 ); // mirror protocol style (text or binary)
+                        ack.message=htonl(1); ack.protocol=htons(17); ack.major_version=htons(1); ack.minor_version=htons(1); sendto(s,&ack,sizeof(ack),0,(sockaddr*)&ca,clen);
+                        bool wantText = enableText && ctype==21;
+                        if(existing==tasks.end() || existing->second.done){ Task t=makeTask(nextId++); t.text=wantText; tasks[key]=t; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); ++issued; }
+                        else { Task &t=existing->second; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); }
+                        continue; }
+                }
+                // If new client sends calcProtocol directly with id=0 treat as implicit handshake
+                if(existing==tasks.end() && n>=(ssize_t)24 && n<=(ssize_t)sizeof(calcProtocol)){
+                    calcProtocol cp{}; memcpy(&cp,buf,std::min<size_t>(n,sizeof(cp))); if(ntohs(cp.major_version)==1 && ntohs(cp.minor_version)==1){ uint16_t ttype=ntohs(cp.type); if(ttype==2 || ttype==0){ Task t=makeTask(nextId++); tasks[key]=t; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); ++issued; continue; } }
+                }
+                // Legacy re-send for existing client handshake-size packet
+                if(existing!=tasks.end() && n>=12 && n<=20){ Task &t=existing->second; if(t.done){ Task nt=makeTask(nextId++); tasks[key]=nt; t=nt; } calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); continue; }
                 // Binary answer (accept 24..sizeof(calcProtocol)) client->server must have type=2
                 if(n>=(ssize_t)24 && n<=(ssize_t)sizeof(calcProtocol)){ calcProtocol cp{}; memcpy(&cp,buf,std::min<size_t>(n,sizeof(cp))); if(ntohs(cp.major_version)!=1||ntohs(cp.minor_version)!=1) continue; uint16_t ctype=ntohs(cp.type); if(ctype!=2) { continue; } uint32_t id=ntohl(cp.id); int32_t res=ntohl(cp.inResult); auto it=tasks.find(key); if(it==tasks.end()){ if(id==0){ Task t=makeTask(nextId++); tasks[key]=t; calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); ++issued; } }
                     else { Task &t=it->second; if(!t.done){ if(id==0){ calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); sendto(s,&out,sizeof(out),0,(sockaddr*)&ca,clen); }
@@ -70,7 +86,7 @@ int main(int argc,char*argv[]){
                 }
             }}
         }
-        // Simple proactive resend (lightweight)
+    // Simple proactive resend (lightweight)
     auto now2=Clock::now(); for(auto &kv:tasks){ Task &t=kv.second; if(t.done) continue; auto ms=chrono::duration_cast<chrono::milliseconds>(now2 - t.lastSend).count(); if(ms < 80) continue; int target=(t.resend<2?80:(t.resend<5?140:220)); if(t.resend>=5) target=300; if(t.resend>=8) target=450; if(ms>=target){ calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(t.id); out.arith=htonl(t.op); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); for(int s: sockets){ sendto(s,&out,sizeof(out),0,(sockaddr*)&kv.first.addr,kv.first.len); break; } t.lastSend=now2; ++t.resend; } }
     if(!quiet){ static auto lastPrint=start; if(chrono::duration_cast<chrono::milliseconds>(Clock::now()-lastPrint).count()>=1000){ size_t pending=0; for(auto &kv:tasks) if(!kv.second.done) ++pending; auto elapsedMs=chrono::duration_cast<chrono::milliseconds>(Clock::now()-start).count(); cout<<"DIAG tasks="<<issued<<" ok="<<ok<<" fail="<<fail<<" pend="<<pending<<" elapsedMs="<<elapsedMs<<"\n"; lastPrint=Clock::now(); } }
         // Keep running; do NOT exit automatically after target to stay serviceable.
