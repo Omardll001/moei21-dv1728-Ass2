@@ -50,14 +50,25 @@ static string addrToString(const sockaddr_storage &ss){
 int main(int argc,char*argv[]){
     // DEBUG DEFAULT: Turned ON by default so CodeGrade run (which supplies only <host:port>) will emit EV/DIAG lines to server.log.
     // To silence, pass --nodebug explicitly.
-    bool debug=true;
+    bool debug=true; // debug enables DIAG + high-level events
+    bool trace=true; // trace enables very chatty detailed events (waves etc.)
     bool enableText=false; // text protocol disabled unless --text flag supplied
     if(argc<2){ cerr<<"Usage: "<<argv[0]<<" <host:port> [--nodebug]"<<"\n"; return 1; }
-    if(argc>=3){
-        string flag=argv[2];
-        if(flag=="--nodebug") debug=false; // override to disable
-        else if(flag=="--debug") debug=true; // explicit enable (already default)
-        else if(flag=="--text") enableText=true; // allow text protocol explicitly
+    // Parse optional flags (up to a few)
+    for(int i=2;i<argc;i++){
+        string flag=argv[i];
+        if(flag=="--nodebug") { debug=false; trace=false; }
+        else if(flag=="--debug") { debug=true; }
+        else if(flag=="--trace") { trace=true; debug=true; }
+        else if(flag=="--quiet") { debug=false; trace=false; }
+        else if(flag=="--text") { enableText=true; }
+        else if(flag.rfind("--loglevel=",0)==0){
+            string lvl=flag.substr(11);
+            if(lvl=="info"){ debug=true; trace=false; }
+            else if(lvl=="debug"){ debug=true; trace=false; }
+            else if(lvl=="trace"){ debug=true; trace=true; }
+            else if(lvl=="quiet"){ debug=false; trace=false; }
+        }
     }
     // Environment variable can still force on (harmless if already true)
     if(!debug){ const char *e=getenv("UDPSRV_DEBUG"); if(e && *e) debug=true; }
@@ -85,11 +96,15 @@ int main(int argc,char*argv[]){
     // Fallback: if 'localhost' given but nothing worked, try generic resolution once
     if(socks.empty() && specialLocalHost){ doBind("localhost"); }
     if(socks.empty()){ cerr<<"bind failed\n"; return 1; }
-    cout<<"udpserver running on "<<host<<":"<<port<<" sockets="<<socks.size(); if(debug) cout<<" DEBUG=on"; cout<<"\n"; cout.flush();
+    cout<<"udpserver running on "<<host<<":"<<port<<" sockets="<<socks.size(); if(debug){ cout<<" DEBUG=on"; if(trace) cout<<" TRACE=on"; } cout<<"\n"; cout.flush();
     unordered_map<ClientKey,TaskInfo,ClientHash> tasks; uint32_t nextId=1;
     // Diagnostics counters (debug only)
     size_t pkt_recv=0, pkt_binary=0, pkt_text=0, tasks_issued=0, answers_ok=0, answers_fail=0, resend_task=0, reack=0;
     auto lastDiag = Clock::now();
+    auto lastDiagForced = Clock::now();
+    // Snapshot of last printed counters to suppress duplicates
+    size_t last_pkt_recv=SIZE_MAX, last_pkt_binary=SIZE_MAX, last_pkt_text=SIZE_MAX, last_tasks_issued=SIZE_MAX,
+        last_answers_ok=SIZE_MAX, last_answers_fail=SIZE_MAX, last_resend_task=SIZE_MAX, last_reack=SIZE_MAX, last_outstanding=SIZE_MAX;
     while(g_run){
         fd_set rfds; FD_ZERO(&rfds); int maxfd=0; for(int s: socks){ FD_SET(s,&rfds); if(s>maxfd) maxfd=s; }
         // Reduced latency: 10ms select timeout
@@ -121,14 +136,15 @@ int main(int argc,char*argv[]){
                 ClientKey key; key.addr=caddr; key.len=clen;
                 // Fast drop malformed sizes (not calcMessage=12, not calcProtocol=sizeof(calcProtocol), and text not enabled)
                 if(!enableText && (size_t)n!=sizeof(calcMessage) && (size_t)n!=sizeof(calcProtocol)){
-                    // Special-case: some clients appear to send 13-byte handshake (extra padding). Accept if >=12.
-                    if(n==13){ /* fallthrough treat first 12 bytes as handshake */ }
-                    else { if(debug) cout<<"EV DROP size="<<n<<" addr="<<addrToString(caddr)<<"\n"; continue; }
+                    if(n==13){
+                        if(trace) cout<<"EV TRUNC13 treat-as-handshake addr="<<addrToString(caddr)<<"\n";
+                        // fallthrough: first 12 bytes used below
+                    } else { if(trace) cout<<"EV DROP size="<<n<<" addr="<<addrToString(caddr)<<"\n"; continue; }
                 }
                 if(enableText){
                     // If enabled text, still drop obviously invalid tiny/huge packets (1..3 or >128) to avoid wasting cycles
                     if((size_t)n!=sizeof(calcMessage) && (size_t)n!=sizeof(calcProtocol)){
-                        if(n<5 || n>200){ if(debug) cout<<"EV DROP size(text-mode)="<<n<<" addr="<<addrToString(caddr)<<"\n"; continue; }
+                        if(n<5 || n>200){ if(trace) cout<<"EV DROP size(text-mode)="<<n<<" addr="<<addrToString(caddr)<<"\n"; continue; }
                     }
                 }
                 // (Optional) calcMessage handshake: treat as 'new request' when no task or re-ACK when done
@@ -141,7 +157,7 @@ int main(int argc,char*argv[]){
                         if(itT==tasks.end()){
                             // Capacity guard: avoid unbounded growth if clients churn ports
                             size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
-                            if(activePending>=110) { if(debug) cout<<"EV DROP newtask-cap bin(handshake) addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; continue; }
+                            if(activePending>=110) { if(trace) cout<<"EV DROP newtask-cap bin(handshake) addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; continue; }
                             TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t;
                             if(debug) cout<<"EV NEWTASK bin(handshake) id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
@@ -151,7 +167,7 @@ int main(int argc,char*argv[]){
                             // Instead of only re-ACK, give a new task so client can progress
                             size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
                             if(activePending>=110) {
-                                if(debug) cout<<"EV DROP newtask-cap bin(handshake-after-done) addr="<<addrToString(caddr)<<" active="<<activePending<<"\n";
+                                if(trace) cout<<"EV DROP newtask-cap bin(handshake-after-done) addr="<<addrToString(caddr)<<" active="<<activePending<<"\n";
                                 // still send re-ack so client knows status
                                 calcMessage msg{}; msg.type=htons(2); msg.message=htonl(itT->second.lastOk?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
                                 sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen);
@@ -163,7 +179,7 @@ int main(int argc,char*argv[]){
                                 if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-handshake-newtask"); else ++tasks_issued;
                             }
                         } else {
-                            if(debug) cout<<"EV RESEND bin(handshake) id="<<itT->second.id<<" addr="<<addrToString(caddr)<<"\n";
+                            if(trace) cout<<"EV RESEND bin(handshake) id="<<itT->second.id<<" addr="<<addrToString(caddr)<<"\n";
                             // resend ongoing task
                             TaskInfo &t=itT->second; t.sockfd=s;
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
@@ -184,7 +200,7 @@ int main(int argc,char*argv[]){
                 if(it==tasks.end()){
                     if(idNet==0){
                         size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
-                        if(activePending>=110) { if(debug) cout<<"EV DROP newtask-cap bin addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
+                        if(activePending>=110) { if(trace) cout<<"EV DROP newtask-cap bin addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
                         else { TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t;
                         if(debug) cout<<"EV NEWTASK bin id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                         calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
@@ -198,7 +214,7 @@ int main(int argc,char*argv[]){
                     if(!t.done){
                         if(idNet==0){
                             // resend task
-                            if(debug) cout<<"EV RESEND bin id="<<t.id<<" addr="<<addrToString(caddr)<<"\n";
+                            if(trace) cout<<"EV RESEND bin id="<<t.id<<" addr="<<addrToString(caddr)<<"\n";
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                             out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                             if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-resend"); else ++resend_task;
@@ -213,7 +229,7 @@ int main(int argc,char*argv[]){
                             if(debug) cout<<"EV ANSWER bin id="<<t.id<<" ok="<<ok<<" expect="<<real<<" got="<<inRes<<" age="<<age<<" addr="<<addrToString(caddr)<<"\n";
                             if(ok) ++answers_ok; else ++answers_fail; t.done=true; t.finished=Clock::now(); t.lastOk=ok;
                         } else {
-                            if(debug) cout<<"EV STRAY bin curId="<<t.id<<" gotId="<<idNet<<" addr="<<addrToString(caddr)<<"\n";
+                            if(trace) cout<<"EV STRAY bin curId="<<t.id<<" gotId="<<idNet<<" addr="<<addrToString(caddr)<<"\n";
                             // stray answer ignored
                         }
                     } else {
@@ -228,9 +244,9 @@ int main(int argc,char*argv[]){
                             // duplicate answer re-ACK
                             calcMessage msg{}; msg.type=htons(2); msg.message=htonl(t.lastOk?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
                             if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-reack"); else ++reack;
-                            if(debug) cout<<"EV REACK bin duplicate id="<<t.id<<" ok="<<t.lastOk<<" addr="<<addrToString(caddr)<<"\n";
+                            if(trace) cout<<"EV REACK bin duplicate id="<<t.id<<" ok="<<t.lastOk<<" addr="<<addrToString(caddr)<<"\n";
                         } else {
-                            if(debug) cout<<"EV STRAY bin-done prevId="<<t.id<<" gotId="<<idNet<<" addr="<<addrToString(caddr)<<"\n";
+                            if(trace) cout<<"EV STRAY bin-done prevId="<<t.id<<" gotId="<<idNet<<" addr="<<addrToString(caddr)<<"\n";
                             // ignore
                         }
                     }
@@ -244,14 +260,14 @@ int main(int argc,char*argv[]){
                     if(txt=="TEXT UDP 1.1"){
                         if(it==tasks.end() || it->second.done){
                             size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
-                            if(activePending>=110) { if(debug) cout<<"EV DROP newtask-cap text addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
+                            if(activePending>=110) { if(trace) cout<<"EV DROP newtask-cap text addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
                             else { TaskInfo t=makeTask(nextId++); t.isText=true; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t;
                             if(debug) cout<<"EV NEWTASK text id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                             string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
                             if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-task"); else ++tasks_issued; }
                         } else if(it->second.isText){
                             TaskInfo &t=it->second; t.sockfd=s; string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
-                            if(debug) cout<<"EV RESEND text id="<<t.id<<" addr="<<addrToString(caddr)<<"\n";
+                            if(trace) cout<<"EV RESEND text id="<<t.id<<" addr="<<addrToString(caddr)<<"\n";
                             if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-resend"); else ++resend_task;
                             t.lastSend=Clock::now();
                         } else {
@@ -272,7 +288,7 @@ int main(int argc,char*argv[]){
                             } else if(parsed){
                                 string resp=string("NOT OK ");
                                 if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-reject");
-                                if(debug) cout<<"EV ANSWER text WRONG rid="<<rid<<" cur="<<it->second.id<<" addr="<<addrToString(caddr)<<"\n";
+                                if(trace) cout<<"EV ANSWER text WRONG rid="<<rid<<" cur="<<it->second.id<<" addr="<<addrToString(caddr)<<"\n";
                                 ++answers_fail; it->second.done=true; it->second.finished=Clock::now(); it->second.lastOk=false;
                             }
                         }
@@ -281,13 +297,14 @@ int main(int argc,char*argv[]){
             }
         } // end socks loop
         } // end if(sel>0)
-        // Proactive resend: for pending tasks not done, resend every 400ms until age>=10s using correct socket
+        // Proactive resend: aggregated logging. We batch tasks that need resend this wave.
+        static unsigned long resendWave=0; // monotonically increasing wave counter
+        vector<int> waveIds; waveIds.reserve(64);
         auto nowPR = Clock::now();
         for(auto &kv : tasks){
             TaskInfo &t = kv.second; if(t.done) continue; auto ms=chrono::duration_cast<chrono::milliseconds>(nowPR - t.lastSend).count();
             auto ageS = chrono::duration_cast<chrono::seconds>(nowPR - t.ts).count();
             if(ageS>=10) continue; // nearing cleanup
-            // Adaptive interval: fast early (250ms) then 400ms, with small deterministic jitter to de-sync bursts
             int base = (t.resendCount < 5 ? 250 : 400);
             int jitter = ((int)t.id * 31 + t.resendCount * 17) % 40; // 0..39ms
             int target = base + jitter;
@@ -297,28 +314,45 @@ int main(int argc,char*argv[]){
                 const sockaddr_storage &caddr = kv.first.addr; socklen_t clen = kv.first.len;
                 if(t.isText){
                     string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
-                    if(sendto(useSock,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-proactive-text"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; if(debug) cout<<"EV PROACTIVE_RESEND text id="<<t.id<<" cnt="<<t.resendCount<<"\n"; }
+                    if(sendto(useSock,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-proactive-text"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; waveIds.push_back(t.id); }
                 } else {
                     calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                     out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
-                    if(sendto(useSock,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-proactive-bin"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; if(debug) cout<<"EV PROACTIVE_RESEND bin id="<<t.id<<" cnt="<<t.resendCount<<"\n"; }
+                    if(sendto(useSock,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-proactive-bin"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; waveIds.push_back(t.id); }
                 }
             }
         }
-        auto now2 = Clock::now(); if(chrono::duration_cast<chrono::seconds>(now2 - lastDiag).count()>=1){
-            // Always send DIAG to stdout so CodeGrade captures it in server.log
-            if(debug) {
-                cout << "DIAG pkts="<<pkt_recv<<" bin="<<pkt_binary<<" txt="<<pkt_text<<" tasks="<<tasks_issued<<" resend="<<resend_task<<" ok="<<answers_ok<<" fail="<<answers_fail<<" reack="<<reack<<" outstanding="<<tasks.size()<<"\n";
-                // Pending summary (up to 12 tasks) id(ageS,resend)
-                if(!tasks.empty()){
+        if(trace && !waveIds.empty()){
+            ++resendWave;
+            // Show at most first 16 ids, plus counts summary. Provide min/max resendCount among them.
+            int shown = min<size_t>(waveIds.size(),16);
+            int minR=INT32_MAX, maxR=0; for(auto &kv:tasks){ if(!kv.second.done) { minR=min(minR,kv.second.resendCount); maxR=max(maxR,kv.second.resendCount);} }
+            cout<<"EV PROACTIVE_RESEND_WAVE num="<<waveIds.size()<<" wave="<<resendWave<<" ids=";
+            for(int i=0;i<shown;++i){ if(i) cout<<","; cout<<waveIds[i]; }
+            if((int)waveIds.size()>shown) cout<<"...";
+            cout<<" resendRange="<<minR<<"-"<<maxR<<"\n";
+        }
+        auto now2 = Clock::now();
+        // Compute pending (not done) tasks for more meaningful 'outstanding'
+        size_t pendingCount=0; for(auto &kv:tasks) if(!kv.second.done) ++pendingCount;
+        bool countersChanged = pkt_recv!=last_pkt_recv || pkt_binary!=last_pkt_binary || pkt_text!=last_pkt_text ||
+                               tasks_issued!=last_tasks_issued || answers_ok!=last_answers_ok || answers_fail!=last_answers_fail ||
+                               resend_task!=last_resend_task || reack!=last_reack || pendingCount!=last_outstanding;
+        bool timeForForced = chrono::duration_cast<chrono::seconds>(now2 - lastDiagForced).count()>=2; // force every 2s
+        if(countersChanged || chrono::duration_cast<chrono::seconds>(now2 - lastDiag).count()>=1 || timeForForced){
+            if(debug){
+                cout << "DIAG pkts="<<pkt_recv<<" bin="<<pkt_binary<<" txt="<<pkt_text<<" tasks="<<tasks_issued<<" resend="<<resend_task<<" ok="<<answers_ok<<" fail="<<answers_fail<<" reack="<<reack<<" outstanding="<<pendingCount<<"\n";
+                if(pendingCount>0){
                     int shown=0; cout<<"PEND ";
                     for(auto &kv:tasks){ if(shown>=12) break; const TaskInfo &t=kv.second; if(t.done) continue; auto ageS=chrono::duration_cast<chrono::milliseconds>(now2 - t.ts).count()/1000.0; cout<<t.id<<"("<<ageS<<"s,r="<<t.resendCount<<") "; ++shown; }
                     cout<<"\n";
                 }
             } else {
-                cout << "DIAG pkts="<<pkt_recv<<" tasks="<<tasks_issued<<" ok="<<answers_ok<<" fail="<<answers_fail<<" out="<<tasks.size()<<"\n";
+                cout << "DIAG pkts="<<pkt_recv<<" tasks="<<tasks_issued<<" ok="<<answers_ok<<" fail="<<answers_fail<<" out="<<pendingCount<<"\n";
             }
-            lastDiag=now2;
+            last_pkt_recv=pkt_recv; last_pkt_binary=pkt_binary; last_pkt_text=pkt_text; last_tasks_issued=tasks_issued;
+            last_answers_ok=answers_ok; last_answers_fail=answers_fail; last_resend_task=resend_task; last_reack=reack; last_outstanding=pendingCount;
+            lastDiag=now2; if(timeForForced) lastDiagForced=now2;
         }
     }
     for(int s: socks) {
