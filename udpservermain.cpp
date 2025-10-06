@@ -178,8 +178,8 @@ int main(int argc, char *argv[]) {
                     to_delete.push_back(p.first);
                     continue;
                 }
-                // Finished (ACK sent) – keep a short grace period (2s) to allow client to retransmit answer
-                if (!p.second.waiting && p.second.finished && (now - p.second.timestamp) > 2) {
+                // Finished (ACK sent) – keep a grace period (8s) to allow client to retransmit answer
+                if (!p.second.waiting && p.second.finished && (now - p.second.timestamp) > 8) {
                     to_delete.push_back(p.first);
                     continue;
                 }
@@ -272,7 +272,12 @@ int main(int argc, char *argv[]) {
 
 
                 if (is_valid_binary_protocol(cp_host)) {
+                    bool is_answer = (cp_host.type == 2);
                     if (!client_exists) {
+                        if (is_answer) {
+                            // Can't start with an answer packet
+                            continue;
+                        }
                         // New binary client - send task
                         ClientState cs{};
                         cs.is_binary = true;
@@ -319,48 +324,36 @@ int main(int argc, char *argv[]) {
 
                         if (cs.waiting) {
                             // Awaiting answer for current task
+                            if (!is_answer) {
+                                // Probably a duplicate request -> resend task
+                                calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1;
+                                out.id = cs.task_id; out.arith = cs.arith; out.inValue1 = cs.v1; out.inValue2 = cs.v2; out.inResult = 0;
+                                send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                                continue;
+                            }
                             if (cp_host.id != cs.task_id) {
-                                // Wrong id -> reject (NOT OK) keep state (still waiting for correct id)
+                                // Wrong id -> NOT OK finalize round
                                 send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                                cs.waiting = false; cs.finished = true; cs.last_ack = 2; cs.timestamp = now;
+                            } else if ((now - cs.timestamp) > 10) {
+                                send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                                cs.waiting = false; cs.finished = true; cs.last_ack = 2; cs.timestamp = now;
                             } else {
-                                if ((now - cs.timestamp) > 10) {
-                                    // Timeout -> NOT OK finalize
-                                    send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
-                                    cs.waiting = false;
-                                    cs.finished = true;
-                                    cs.last_ack = 2;
-                                    cs.timestamp = now;
-                                } else {
-                                    int32_t received_result = (int32_t)cp_host.inResult;
-                                    uint32_t ack = (received_result == cs.expected) ? 1 : 2;
-                                    send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, ack);
-                                    cs.waiting = false;
-                                    cs.finished = true;
-                                    cs.last_ack = ack;
-                                    cs.timestamp = now; // use for graceful duplicate window
-                                }
+                                int32_t received_result = (int32_t)cp_host.inResult;
+                                uint32_t ack = (received_result == cs.expected) ? 1 : 2;
+                                send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, ack);
+                                cs.waiting = false; cs.finished = true; cs.last_ack = ack; cs.timestamp = now;
                             }
                             continue;
                         } else if (cs.finished) {
-                            // Only resend previous ACK if duplicate of same task; never start a new one.
-                            if (cp_host.id == cs.task_id) {
+                            // Resend prior ACK only; do not start new task
+                            if (is_answer && cp_host.id == cs.task_id) {
                                 send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, cs.last_ack);
-                                cs.timestamp = now; // extend grace for duplicates
+                                cs.timestamp = now;
                             }
                             continue;
                         } else {
-                            // State exists but neither waiting nor finished (should not happen) -> start new task
-                            uint32_t code = (rand() % 4) + 1;
-                            int32_t a = randomInt();
-                            int32_t b = randomInt();
-                            if (code == 4 && b == 0) b = 1;
-                            int32_t expected = (code == 1) ? (a + b) : (code == 2) ? (a - b) : (code == 3) ? (a * b) : (a / b);
-                            uint32_t id = (uint32_t)(rand() ^ time(NULL));
-                            cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
-                            cs.waiting = true; cs.finished = false; cs.last_ack = 0; cs.timestamp = now;
-                            calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1;
-                            out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
-                            send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                            // Unexpected state -> ignore
                             continue;
                         }
                     }
@@ -405,14 +398,8 @@ int main(int argc, char *argv[]) {
                             calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1; out.id = cs.task_id; out.arith = cs.arith; out.inValue1 = cs.v1; out.inValue2 = cs.v2; out.inResult = 0;
                             send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
                         } else if (cs.finished) {
-                            // Start a new round so client can proceed to completion summary
-                            cs.is_binary = true; cs.waiting = true; cs.finished = false; cs.last_ack = 0; cs.timestamp = now;
-                            uint32_t code = (rand() % 4) + 1; int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
-                            int32_t expected = (code == 1) ? (a + b) : (code == 2) ? (a - b) : (code == 3) ? (a * b) : (a / b);
-                            uint32_t id = (uint32_t)(rand() ^ time(NULL));
-                            cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
-                            calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1; out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
-                            send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                            // Single-round: resend final ACK only
+                            send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, cs.last_ack);
                         } else {
                             // Unexpected state -> start fresh task
                             cs.is_binary = true; cs.waiting = true; cs.finished = false; cs.last_ack = 0; cs.timestamp = now;
