@@ -176,8 +176,21 @@ int main(int argc, char *argv[]) {
             auto it = clients.find(key);
             bool client_exists = (it != clients.end());
 
+            // Check for various invalid message sizes first
+            if (n == 0) {
+                // Empty message - ignore
+                continue;
+            }
+            
+            if (n == sizeof(calcMessage) - 4 || (n > sizeof(calcMessage) && n != sizeof(calcProtocol))) {
+                // Incorrect size for calcMessage - send error response
+                const char *err = "ERROR WRONG SIZE\n";
+                sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+                continue;
+            }
+            
             // Try to parse as binary first
-            if (n >= (ssize_t)sizeof(calcProtocol)) {
+            if (n == (ssize_t)sizeof(calcProtocol)) {
                 calcProtocol cp_net;
                 memcpy(&cp_net, buf, sizeof(calcProtocol));
                 calcProtocol cp_host;
@@ -200,8 +213,8 @@ int main(int argc, char *argv[]) {
                         
                         uint32_t code = (rand() % 4) + 1;
                         int32_t a = randomInt();
-                        int32_t b = (code == 4) ? ((randomInt() == 0) ? 1 : randomInt()) : randomInt();
-                        if (code == 4 && b == 0) b = 1;
+                        int32_t b = randomInt();
+                        if (code == 4 && b == 0) b = 1;  // Avoid division by zero
                         
                         int32_t expected = 0;
                         if (code == 1) expected = a + b;
@@ -280,7 +293,8 @@ int main(int argc, char *argv[]) {
                                     send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
                                     clients.erase(it);
                                 } else {
-                                    if (cp_host.inResult == (uint32_t)cs.expected) {
+                                    int32_t received_result = (int32_t)cp_host.inResult;
+                                    if (received_result == cs.expected) {
                                         send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 1);
                                     } else {
                                         send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
