@@ -342,27 +342,11 @@ int main(int argc, char *argv[]) {
                             }
                             continue;
                         } else if (cs.finished) {
-                            // Duplicate answer retransmission? If id matches resend last ack
+                            // Only resend previous ACK if duplicate of same task; never start a new one.
                             if (cp_host.id == cs.task_id) {
                                 send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, cs.last_ack);
-                                cs.timestamp = now; // extend grace
-                                continue;
+                                cs.timestamp = now; // extend grace for duplicates
                             }
-                            // New round request (different id or client started over) -> allocate new task
-                            uint32_t code = (rand() % 4) + 1;
-                            int32_t a = randomInt();
-                            int32_t b = randomInt();
-                            if (code == 4 && b == 0) b = 1;
-                            int32_t expected = (code == 1) ? (a + b) : (code == 2) ? (a - b) : (code == 3) ? (a * b) : (a / b);
-                            uint32_t id = (uint32_t)(rand() ^ time(NULL));
-                            cs.task_id = id;
-                            cs.expected = expected;
-                            cs.v1 = a; cs.v2 = b; cs.arith = code;
-                            cs.waiting = true; cs.finished = false; cs.last_ack = 0; cs.timestamp = now;
-                            calcProtocol out{};
-                            out.type = 1; out.major_version = 1; out.minor_version = 1;
-                            out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
-                            send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
                             continue;
                         } else {
                             // State exists but neither waiting nor finished (should not happen) -> start new task
