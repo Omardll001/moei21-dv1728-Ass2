@@ -18,6 +18,9 @@
 #include "protocol.h"
 #include "calcLib.h"
 #include "myGitdata.h"
+#ifndef COMMIT_HASH
+#define COMMIT_HASH "unknown"
+#endif
 
 using namespace std;
 using Clock = chrono::steady_clock;
@@ -70,11 +73,20 @@ int main(int argc,char*argv[]){
         timeval tv{0,100000}; int sel=select(maxfd+1,&rfds,nullptr,nullptr,&tv); if(sel<0){ if(errno==EINTR) continue; perror("select"); break; }
         auto now=Clock::now(); for(auto it=tasks.begin(); it!=tasks.end();){ auto age=chrono::duration_cast<chrono::seconds>(now - it->second.ts).count(); if(age>10) it=tasks.erase(it); else ++it; }
         if(sel==0) continue;
-        for(int s: socks){ if(!FD_ISSET(s,&rfds)) continue; for(int drain=0; drain<1024; ++drain){ sockaddr_storage caddr{}; socklen_t clen=sizeof(caddr); unsigned char buf[256]; ssize_t n=recvfrom(s,buf,sizeof(buf),MSG_DONTWAIT,(sockaddr*)&caddr,&clen); if(n<0){ if(errno==EAGAIN||errno==EWOULDBLOCK) break; else {perror("recvfrom"); break;} }
-            if(n<0) break; ++pkt_recv; ClientKey key; key.addr=caddr; key.len=clen;
-            if((size_t)n == sizeof(calcProtocol)) { // exact match -> binary
-                ++pkt_binary; calcProtocol cp{}; memcpy(&cp,buf,sizeof(cp));
-                uint16_t type=ntohs(cp.type); uint16_t maj=ntohs(cp.major_version); uint16_t min=ntohs(cp.minor_version);
+        for(int s: socks){
+            if(!FD_ISSET(s,&rfds)) continue;
+            for(int drain=0; drain<1024; ++drain){
+                sockaddr_storage caddr{}; socklen_t clen=sizeof(caddr); unsigned char buf[256];
+                ssize_t n=recvfrom(s,buf,sizeof(buf),MSG_DONTWAIT,(sockaddr*)&caddr,&clen);
+                if(n<0){
+                    if(errno==EAGAIN||errno==EWOULDBLOCK) break; else { perror("recvfrom"); break; }
+                }
+                if(n<0) break;
+                ++pkt_recv;
+                ClientKey key; key.addr=caddr; key.len=clen;
+                if((size_t)n == sizeof(calcProtocol)) { // exact match -> binary
+                    ++pkt_binary; calcProtocol cp{}; memcpy(&cp,buf,sizeof(cp));
+                    uint16_t /*type*/ maj=ntohs(cp.major_version); uint16_t min=ntohs(cp.minor_version);
                 // Accept both legacy (1/2) and assignment provided (21/22) client type codes
                 if(!(maj==1 && min==1)) continue;
                 auto it=tasks.find(key);
@@ -116,12 +128,38 @@ int main(int argc,char*argv[]){
                         // Different id -> ignore or optionally send rejection (ignore silently to be tolerant)
                     }
                 }
-            } else { // treat as TEXT
-                ++pkt_text; string txt((char*)buf,(size_t)n); txt.erase(remove(txt.begin(),txt.end(),'\r'),txt.end()); txt.erase(remove(txt.begin(),txt.end(),'\n'),txt.end()); auto it=tasks.find(key); if(txt=="TEXT UDP 1.1"){ TaskInfo t; if(it==tasks.end()){ t=makeTask(nextId++); t.isText=true; tasks[key]=t; } else t=it->second; string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n"; if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-task"); else ++tasks_issued; }
-                else if(it!=tasks.end() && it->second.isText){ size_t sp=txt.find(' '); if(sp!=string::npos){ bool parsed=true; uint32_t rid=0; long long ans=0; try{ rid=stoul(txt.substr(0,sp)); ans=stoll(txt.substr(sp+1)); }catch(...){ parsed=false; } if(parsed && rid==it->second.id){ auto age=chrono::duration_cast<chrono::seconds>(now - it->second.ts).count(); long long real=eval(it->second); bool ok=(age<=10)&&(ans==real); string resp=(ok?"OK ":"NOT OK ")+string(COMMIT_HASH)+"\n"; if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-answer"); if(ok) ++answers_ok; else ++answers_fail; tasks.erase(it);} else if(parsed){ string resp=string("NOT OK ")+COMMIT_HASH+"\n"; if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-reject"); ++answers_fail; tasks.erase(it);} }
+                } else { // treat as TEXT
+                    ++pkt_text;
+                    string txt((char*)buf,(size_t)n);
+                    txt.erase(remove(txt.begin(),txt.end(),'\r'),txt.end());
+                    txt.erase(remove(txt.begin(),txt.end(),'\n'),txt.end());
+                    auto it=tasks.find(key);
+                    if(txt=="TEXT UDP 1.1"){
+                        TaskInfo t;
+                        if(it==tasks.end()){ t=makeTask(nextId++); t.isText=true; tasks[key]=t; } else t=it->second;
+                        string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
+                        if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-task"); else ++tasks_issued;
+                    } else if(it!=tasks.end() && it->second.isText){
+                        size_t sp=txt.find(' ');
+                        if(sp!=string::npos){
+                            bool parsed=true; uint32_t rid=0; long long ans=0;
+                            try{ rid=stoul(txt.substr(0,sp)); ans=stoll(txt.substr(sp+1)); }catch(...){ parsed=false; }
+                            if(parsed && rid==it->second.id){
+                                auto age=chrono::duration_cast<chrono::seconds>(now - it->second.ts).count();
+                                long long real=eval(it->second); bool ok=(age<=10)&&(ans==real);
+                                string resp=(ok?"OK ":"NOT OK ")+string(COMMIT_HASH)+"\n";
+                                if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-answer");
+                                if(ok) ++answers_ok; else ++answers_fail; tasks.erase(it);
+                            } else if(parsed){
+                                string resp=string("NOT OK ")+COMMIT_HASH+"\n";
+                                if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-reject");
+                                ++answers_fail; tasks.erase(it);
+                            }
+                        }
+                    }
                 }
             }
-        } }
+        }
         auto now2 = Clock::now(); if(chrono::duration_cast<chrono::seconds>(now2 - lastDiag).count()>=1){
             cerr << "DIAG pkts="<<pkt_recv<<" bin="<<pkt_binary<<" txt="<<pkt_text<<" tasks="<<tasks_issued<<" resend="<<resend_task<<" ok="<<answers_ok<<" fail="<<answers_fail<<" outstanding="<<tasks.size()<<"\n"; lastDiag=now2;
         }

@@ -17,10 +17,10 @@ main.o: main.cpp
 test: main.o calcLib.o
 	$(CXX) $(LD_FLAGS) -o test main.o -lcalc
 
-tcpserver: tcpservermain.o calcLib.o
+tcpserver: tcpservermain.o libcalc
 	$(CXX) $(LD_FLAGS) -o tcpserver tcpservermain.o -lcalc
 
-udpserver: udpservermain.o calcLib.o
+udpserver: udpservermain.o libcalc
 	$(CXX) $(LD_FLAGS) -o udpserver udpservermain.o -lcalc
 
 
@@ -28,7 +28,9 @@ calcLib.o: calcLib.c calcLib.h
 	gcc -Wall -fPIC -c calcLib.c
 
 libcalc: calcLib.o
-	ar -rc libcalc.a -o calcLib.o
+	ar -rc libcalc.a calcLib.o
+
+.PHONY: all clean
 
 clean:
-	rm *.o *.a test tcpserver udpserver 
+	rm -f *.o *.a test tcpserver udpserver 
