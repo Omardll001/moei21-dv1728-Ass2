@@ -106,7 +106,8 @@ int main(int argc,char*argv[]){
             }
             ++it;
         }
-        if(sel==0) continue;
+        // Even if sel==0 (no new packets), we still want to run proactive resend & diagnostics below.
+        if(sel>0){
         for(int s: socks){
             if(!FD_ISSET(s,&rfds)) continue;
             for(int drain=0; drain<1024; ++drain){
@@ -120,8 +121,9 @@ int main(int argc,char*argv[]){
                 ClientKey key; key.addr=caddr; key.len=clen;
                 // Fast drop malformed sizes (not calcMessage=12, not calcProtocol=sizeof(calcProtocol), and text not enabled)
                 if(!enableText && (size_t)n!=sizeof(calcMessage) && (size_t)n!=sizeof(calcProtocol)){
-                    if(debug) cout<<"EV DROP size="<<n<<" addr="<<addrToString(caddr)<<"\n"; 
-                    continue;
+                    // Special-case: some clients appear to send 13-byte handshake (extra padding). Accept if >=12.
+                    if(n==13){ /* fallthrough treat first 12 bytes as handshake */ }
+                    else { if(debug) cout<<"EV DROP size="<<n<<" addr="<<addrToString(caddr)<<"\n"; continue; }
                 }
                 if(enableText){
                     // If enabled text, still drop obviously invalid tiny/huge packets (1..3 or >128) to avoid wasting cycles
@@ -130,7 +132,7 @@ int main(int argc,char*argv[]){
                     }
                 }
                 // (Optional) calcMessage handshake: treat as 'new request' when no task or re-ACK when done
-                if((size_t)n == sizeof(calcMessage)) {
+                if((size_t)n == sizeof(calcMessage) || n==13) {
                     calcMessage cm{}; memcpy(&cm,buf,sizeof(cm));
                     uint16_t maj=ntohs(cm.major_version), min=ntohs(cm.minor_version);
                     uint16_t ctype=ntohs(cm.type);
@@ -277,7 +279,8 @@ int main(int argc,char*argv[]){
                     }
                 }
             }
-        }
+        } // end socks loop
+        } // end if(sel>0)
         // Proactive resend: for pending tasks not done, resend every 400ms until age>=10s using correct socket
         auto nowPR = Clock::now();
         for(auto &kv : tasks){
