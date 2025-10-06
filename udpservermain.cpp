@@ -135,9 +135,20 @@ int main(int argc,char*argv[]){
                             out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                             if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-handshake"); else ++tasks_issued;
                         } else if(itT->second.done){
-                            if(debug) cout<<"EV REACK bin id="<<itT->second.id<<" ok="<<itT->second.lastOk<<" addr="<<addrToString(caddr)<<"\n";
-                            calcMessage msg{}; msg.type=htons(2); msg.message=htonl(itT->second.lastOk?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
-                            if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-reack-msg"); else ++reack;
+                            // Instead of only re-ACK, give a new task so client can progress
+                            size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
+                            if(activePending>=110) {
+                                if(debug) cout<<"EV DROP newtask-cap bin(handshake-after-done) addr="<<addrToString(caddr)<<" active="<<activePending<<"\n";
+                                // still send re-ack so client knows status
+                                calcMessage msg{}; msg.type=htons(2); msg.message=htonl(itT->second.lastOk?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
+                                sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen);
+                            } else {
+                                TaskInfo nt=makeTask(nextId++); nt.isText=false; nt.lastSend=Clock::now(); nt.sockfd=s; tasks[key]=nt;
+                                if(debug) cout<<"EV NEWTASK bin(handshake-after-done) id="<<nt.id<<" prev="<<itT->second.id<<" ok="<<itT->second.lastOk<<" addr="<<addrToString(caddr)<<"\n";
+                                calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
+                                out.id=htonl(nt.id); out.arith=htonl(nt.arith); out.inValue1=htonl(nt.v1); out.inValue2=htonl(nt.v2); out.inResult=0;
+                                if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-handshake-newtask"); else ++tasks_issued;
+                            }
                         } else {
                             if(debug) cout<<"EV RESEND bin(handshake) id="<<itT->second.id<<" addr="<<addrToString(caddr)<<"\n";
                             // resend ongoing task
