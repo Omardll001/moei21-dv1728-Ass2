@@ -106,7 +106,10 @@ int main(int argc,char*argv[]){
                     } else {
                         // Unknown task id from client without existing state -> reject
                         calcMessage msg{}; msg.type=htons(2); msg.message=htonl(2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
-                        if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-reject"); ++answers_fail;
+                        if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) {
+                            perror("sendto-reject");
+                        }
+                        ++answers_fail;
                     }
                 } else {
                     TaskInfo &t=it->second;
@@ -164,7 +167,10 @@ int main(int argc,char*argv[]){
             cerr << "DIAG pkts="<<pkt_recv<<" bin="<<pkt_binary<<" txt="<<pkt_text<<" tasks="<<tasks_issued<<" resend="<<resend_task<<" ok="<<answers_ok<<" fail="<<answers_fail<<" outstanding="<<tasks.size()<<"\n"; lastDiag=now2;
         }
     }
-    for(int s: socks) close(s); return 0;
+    for(int s: socks) {
+        close(s);
+    }
+    return 0;
 }
 
 
