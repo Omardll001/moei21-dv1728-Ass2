@@ -33,6 +33,8 @@ struct TaskInfo {
     bool isText=false;         // text protocol task
     bool done=false;           // answer validated and final message sent
     bool lastOk=false;         // final correctness result for accurate re-ACK
+    int mode=0;                // 0=unset,1=binary,2=text
+    int resendAttempts=0;      // controlled resend counter
 };
 struct ClientKey { sockaddr_storage addr{}; socklen_t len{}; bool operator==(ClientKey const& o) const noexcept { if(len!=o.len) return false; if(addr.ss_family!=o.addr.ss_family) return false; if(addr.ss_family==AF_INET){auto *a=(sockaddr_in*)&addr;auto *b=(sockaddr_in*)&o.addr; return a->sin_port==b->sin_port && a->sin_addr.s_addr==b->sin_addr.s_addr;} else {auto *a=(sockaddr_in6*)&addr;auto *b=(sockaddr_in6*)&o.addr; return a->sin6_port==b->sin6_port && memcmp(&a->sin6_addr,&b->sin6_addr,sizeof(in6_addr))==0;} } };
 struct ClientHash { size_t operator()(ClientKey const& k) const noexcept { size_t h=0xcbf29ce484222325ULL; auto mix=[&](const void* d,size_t l){auto p=(const unsigned char*)d; for(size_t i=0;i<l;++i){h^=p[i]; h*=0x100000001b3ULL;}}; if(k.addr.ss_family==AF_INET){auto *a=(sockaddr_in*)&k.addr; mix(&a->sin_port,sizeof(a->sin_port)); mix(&a->sin_addr,sizeof(a->sin_addr));} else {auto *a=(sockaddr_in6*)&k.addr; mix(&a->sin6_port,sizeof(a->sin6_port)); mix(&a->sin6_addr,sizeof(a->sin6_addr));} return h; } };
@@ -149,33 +151,50 @@ int main(int argc,char*argv[]){
                         if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-empty");
                     } else {
                         uint32_t useId = (idNet!=0)? idNet : nextId++;
-                        TaskInfo t=makeTask(useId); t.isText=false; tasks[key]=t; t.lastSend=now;
+                        TaskInfo t=makeTask(useId); t.isText=false; t.mode=1; tasks[key]=t; t.lastSend=now;
                         calcProtocol out{}; out.type=htons(1); // server->client
                         out.major_version=htons(1); out.minor_version=htons(1);
                         out.id=htonl(t.id); out.arith=htonl(t.arith);
                         out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                         if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-task"); else ++tasks_issued;
                     }
-                } else {
-                    TaskInfo &t=it->second;
-                    if(idNet==0 || idNet==t.id){
-                        if(!t.done && idNet==0){
-                            // resend request
+                } else { // existing task handling (binary)
+                    TaskInfo &t = it->second;
+                    if(!t.done) {
+                        if(t.mode==2) {
+                            // Currently in a text task; ignore binary until text completes
+                        } else if(idNet==0) {
+                            // Resend current pending binary task
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); t.lastSend=now;
                             out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                             if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-resend"); else ++resend_task;
-                        } else if(idNet==t.id){
-                        // Treat ANY inRes (including 0) as final answer
-                        auto age=chrono::duration_cast<chrono::seconds>(now - t.ts).count();
-                        int32_t real=eval(t);
-                        calcMessage msg{}; msg.type=htons(2); bool ok=(age<=10)&&(inRes==real);
-                        msg.message=htonl(ok?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
-                        if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-answer");
-                        if(ok) ++answers_ok; else ++answers_fail;
-                        t.done=true; t.finished=Clock::now(); t.lastOk=ok;
+                        } else if(idNet==t.id) {
+                            // Final answer
+                            auto age=chrono::duration_cast<chrono::seconds>(now - t.ts).count();
+                            int32_t real=eval(t);
+                            calcMessage msg{}; msg.type=htons(2); bool ok=(age<=10)&&(inRes==real);
+                            msg.message=htonl(ok?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
+                            if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-answer");
+                            if(ok) ++answers_ok; else ++answers_fail;
+                            t.done=true; t.finished=Clock::now(); t.lastOk=ok;
+                        } else {
+                            // Ignore stray id while pending
                         }
-                    } else {
-                        // Different unexpected id: ignore
+                    } else { // done
+                        if(idNet==0) {
+                            // Client requests a NEW task after completing previous one
+                            uint32_t newId = nextId++;
+                            TaskInfo nt = makeTask(newId); nt.isText=false; nt.mode=1; nt.lastSend=now; tasks[key]=nt;
+                            calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
+                            out.id=htonl(nt.id); out.arith=htonl(nt.arith); out.inValue1=htonl(nt.v1); out.inValue2=htonl(nt.v2); out.inResult=0;
+                            if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-new-after-done"); else ++tasks_issued;
+                        } else if(idNet==t.id) {
+                            // Re-ACK duplicate answer
+                            calcMessage msg{}; msg.type=htons(2); msg.message=htonl(t.lastOk?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
+                            if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-reack-done"); else ++reack;
+                        } else {
+                            // Ignore stray packet (non-zero, different id) after completion.
+                        }
                     }
                 }
                 } else { // treat as TEXT
@@ -185,10 +204,17 @@ int main(int argc,char*argv[]){
                     txt.erase(remove(txt.begin(),txt.end(),'\n'),txt.end());
                     auto it=tasks.find(key);
                     if(txt=="TEXT UDP 1.1"){
-                        TaskInfo t;
-                        if(it==tasks.end()){ t=makeTask(nextId++); t.isText=true; t.lastSend=now; tasks[key]=t; } else { t=it->second; if(!t.isText) t.isText=true; }
-                        string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
-                        if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-task"); else ++tasks_issued;
+                        if(it==tasks.end() || it->second.done){
+                            TaskInfo t=makeTask(nextId++); t.isText=true; t.mode=2; t.lastSend=now; tasks[key]=t;
+                            string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
+                            if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-task"); else ++tasks_issued;
+                        } else if(it->second.mode==2){
+                            // resend existing text task
+                            TaskInfo &t = it->second; string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n"; t.lastSend=now;
+                            if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-resend"); else ++resend_task;
+                        } else {
+                            // existing binary task not finished; ignore text handshake to prevent confusion
+                        }
                     } else if(it!=tasks.end() && it->second.isText){
                         size_t sp=txt.find(' ');
                         if(sp!=string::npos){
@@ -208,6 +234,19 @@ int main(int argc,char*argv[]){
                         }
                     }
                 }
+            }
+        }
+        // Controlled proactive resends (binary only): if no answer yet, mode=1, not done, resend every 700ms up to 5 attempts
+        auto nowResend = Clock::now();
+        for(auto &kv : tasks){
+            TaskInfo &t = kv.second; if(t.done) continue; if(t.mode!=1) continue; // only binary
+            auto msSince = chrono::duration_cast<chrono::milliseconds>(nowResend - t.lastSend).count();
+            if(msSince >= 700 && t.resendAttempts < 5){
+                const ClientKey &ck = kv.first; const sockaddr_storage &caddr = ck.addr; socklen_t clen = ck.len;
+                calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
+                out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0; t.lastSend=nowResend; ++t.resendAttempts;
+                int sendSock = socks.empty()? -1 : socks[0];
+                if(sendSock>=0){ if(sendto(sendSock,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-ctrl-resend"); else ++resend_task; }
             }
         }
         auto now2 = Clock::now(); if(chrono::duration_cast<chrono::seconds>(now2 - lastDiag).count()>=1){

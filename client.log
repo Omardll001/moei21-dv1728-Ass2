@@ -3,7 +3,7 @@ Target: localhost:5352
 Drop probability: 30%
 Test Results:
 Total: 100
-Successful: 73
-Failed: 27
-Success rate: 73%
-SUMMARY: PASSED!
+Successful: 34
+Failed: 66
+Success rate: 34%
+SUMMARY: FAILED!

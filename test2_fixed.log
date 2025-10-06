@@ -1,0 +1,33 @@
+Date: Mon 06 Oct 2025 07:57:56 PM CEST
+Starting your server on localhost:5352
+Sleep abit.
+server on  udpserver 249228 omardll 3u IPv4 1362172 0t0 UDP localhost:5352 udpserver 249228 omardll 4u IPv6 1362173 0t0 UDP ip6-localhost:5352
+Looks good, you got a IPv4 Socket
+PID = 249226 ??
+Checking server.log
+udpserver running on localhost:5352 sockets=2
+Check that server started, SRV_PID = 249228
+249228 .
+Running automatic testing, it will send requests and collect the response.
+The test runs in the background, and we just 'wait' for it to complete. 
+If it does not, we abort.
+We will run 100 tests with a  of a client dropping a message, max 60s. Your server needs to fast enough to handle 100/60 customers/s
+servStat=COMMAND     PID    USER   FD   TYPE DEVICE SIZE/OFF    NODE NAME
+tclsh8.6 249226 omardll    1w   REG  259,9      121 5278081 server.log|
+Waiting for test to complete, max 60s
+.Killing server & client
+udpserver: no process found
+Completed: 100 Successful: 38 Failed: 62
+Problems, see logs
+--------------***-----------2
+
+
+Starting 100 concurrent UDP tests...
+Target: localhost:5352
+Drop probability: 30%
+Test Results:
+Total: 100
+Successful: 38
+Failed: 62
+Success rate: 38%
+SUMMARY: FAILED!
