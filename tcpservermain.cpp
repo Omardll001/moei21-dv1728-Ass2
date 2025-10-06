@@ -35,6 +35,11 @@ using namespace std;
 
 static int conn_fd_for_alarm = -1;
 
+// Function declarations
+void handle_tcp_client(int fd);
+void handle_text_protocol(int fd);
+void handle_binary_protocol(int fd);
+
 void alarm_handler(int) {
     if (conn_fd_for_alarm != -1) {
         const char *msg = "ERROR TO\n";
@@ -80,7 +85,18 @@ int setup_listener(const char *host, const char *port) {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
-    if (getaddrinfo(host, port, &hints, &res) != 0) return -1;
+    
+    // Handle special test hostnames
+    const char *actual_host = host;
+    if (strcmp(host, "ip4-localhost") == 0) {
+        actual_host = "127.0.0.1";
+        hints.ai_family = AF_INET;  // Force IPv4
+    } else if (strcmp(host, "ip6-localhost") == 0) {
+        actual_host = "::1";
+        hints.ai_family = AF_INET6; // Force IPv6
+    }
+    
+    if (getaddrinfo(actual_host, port, &hints, &res) != 0) return -1;
     int listenfd = -1;
     for (rp = res; rp != NULL; rp = rp->ai_next) {
         listenfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
@@ -97,268 +113,215 @@ int setup_listener(const char *host, const char *port) {
     return listenfd;
 }
 
-void handle_binary_client(int fd) {
-    fprintf(stderr, "handle_binary_client: entered (fd=%d)\n", fd);
 
+
+void handle_tcp_client(int fd) {
     conn_fd_for_alarm = fd;
     signal(SIGALRM, alarm_handler);
 
-    // Send BINARY TCP 1.1 greeting immediately
-    const char *greeting = "BINARY TCP 1.1\n";
-    fprintf(stderr, "handle_binary_client: about to send greeting\n");
+    // Send list of supported protocols
+    const char *protocols = "TEXT TCP 1.1\nBINARY TCP 1.1\n\n";
     alarm(5);
-    ssize_t sent = write(fd, greeting, strlen(greeting));
+    ssize_t sent = write(fd, protocols, strlen(protocols));
     alarm(0);
-    fprintf(stderr, "handle_binary_client: write returned %zd (errno=%d %s)\n", sent, (sent<0)?errno:0, (sent<0)?strerror(errno):"");
-    
-    if (sent != (ssize_t)strlen(greeting)) {
+
+    if (sent != (ssize_t)strlen(protocols)) {
         close(fd);
         return;
     }
 
-    // Send assignment info line for compatibility with test4
-    const char *assignment = "ASSIGNMENT: You will receive a binary task. Respond with the correct result.\n";
+    // Wait for client protocol selection
+    std::string client_response;
     alarm(5);
-    write(fd, assignment, strlen(assignment));
-    alarm(0);
-
-    uint32_t current_task_id = 0;
-    int32_t current_expected = 0;
-
-    while (1) {
-        calcProtocol cp_net;
-        
-        // Read client request
-        alarm(5);
-        ssize_t r = full_read(fd, &cp_net, sizeof(cp_net));
-        alarm(0);
-        if (r != sizeof(cp_net)) break;
-
-        // Convert to host order
-        calcProtocol cp;
-        cp.type = ntohs(cp_net.type);
-        cp.major_version = ntohs(cp_net.major_version);
-        cp.minor_version = ntohs(cp_net.minor_version);
-        cp.id = ntohl(cp_net.id);
-        cp.arith = ntohl(cp_net.arith);
-        cp.inValue1 = ntohl(cp_net.inValue1);
-        cp.inValue2 = ntohl(cp_net.inValue2);
-        cp.inResult = ntohl(cp_net.inResult);
-
-        // Validate protocol version
-        if (cp.major_version != 1 || cp.minor_version != 1) {
-            calcMessage msg{};
-            msg.type = htons(2);
-            msg.message = htonl(2); // NOT OK
-            msg.protocol = htons(17);
-            msg.major_version = htons(1);
-            msg.minor_version = htons(1);
-            alarm(5);
-            write(fd, &msg, sizeof(msg));
-            alarm(0);
-            continue;
-        }
-
-        if (cp.type == 22 && cp.id == 0) {
-            // Client requesting task
-            int code = (rand() % 4) + 1;
-            int i1 = randomInt();
-            int i2;
-            if (code == 4) {
-                do { i2 = randomInt(); } while (i2 == 0);
-            } else {
-                i2 = randomInt();
-            }
-
-            int32_t expected = 0;
-            if (code == 1) expected = i1 + i2;
-            else if (code == 2) expected = i1 - i2;
-            else if (code == 3) expected = i1 * i2;
-            else if (code == 4) expected = i1 / i2;
-
-            current_task_id = (uint32_t)(rand() ^ time(NULL));
-            current_expected = expected;
-
-            calcProtocol out{};
-            out.type = htons(1);
-            out.major_version = htons(1);
-            out.minor_version = htons(1);
-            out.id = htonl(current_task_id);
-            out.arith = htonl(code);
-            out.inValue1 = htonl(i1);
-            out.inValue2 = htonl(i2);
-            out.inResult = htonl(0);
-
-            alarm(5);
-            write(fd, &out, sizeof(out));
-            alarm(0);
-        } else if (cp.type == 22 && cp.id != 0) {
-            // Client submitting answer
-            calcMessage msg{};
-            msg.type = htons(2);
-            msg.protocol = htons(17);
-            msg.major_version = htons(1);
-            msg.minor_version = htons(1);
-
-            if (cp.id == current_task_id) {
-                if (cp.inResult == current_expected) {
-                    msg.message = htonl(1); // OK
-                    alarm(5);
-                    write(fd, &msg, sizeof(msg));
-                    alarm(0);
-
-                    // Send human-readable OK line for test4 compatibility
-                    char okline[64];
-                    snprintf(okline, sizeof(okline), "OK (myresult=%d)\n", cp.inResult);
-                    alarm(5);
-                    write(fd, okline, strlen(okline));
-                    alarm(0);
-                } else {
-                    msg.message = htonl(2); // NOT OK
-                    alarm(5);
-                    write(fd, &msg, sizeof(msg));
-                    alarm(0);
-
-                    // Send human-readable NOT OK line
-                    char nokline[64];
-                    snprintf(nokline, sizeof(nokline), "NOT OK (myresult=%d)\n", cp.inResult);
-                    alarm(5);
-                    write(fd, nokline, strlen(nokline));
-                    alarm(0);
-                }
-            } else {
-                msg.message = htonl(2); // NOT OK (wrong ID)
-                alarm(5);
-                write(fd, &msg, sizeof(msg));
-                alarm(0);
-
-                char nokline[64];
-                snprintf(nokline, sizeof(nokline), "NOT OK (wrong id)\n");
-                alarm(5);
-                write(fd, nokline, strlen(nokline));
-                alarm(0);
-            }
-
-            // Reset for next task
-            current_task_id = 0;
-            current_expected = 0;
-        } else {
-            // Invalid type
-            calcMessage msg{};
-            msg.type = htons(2);
-            msg.message = htonl(2); // NOT OK
-            msg.protocol = htons(17);
-            msg.major_version = htons(1);
-            msg.minor_version = htons(1);
-            alarm(5);
-            write(fd, &msg, sizeof(msg));
-            alarm(0);
-
-            char nokline[64];
-            snprintf(nokline, sizeof(nokline), "NOT OK (invalid type)\n");
-            alarm(5);
-            write(fd, nokline, strlen(nokline));
-            alarm(0);
-        }
-    }
-    close(fd);
-}
-
-void handle_text_client(int fd) {
-    conn_fd_for_alarm = fd;
-    signal(SIGALRM, alarm_handler);
-
-    // Send TEXT TCP 1.1 greeting immediately
-    const char *greeting = "TEXT TCP 1.1\n";
-    alarm(5);
-    ssize_t sent = write(fd, greeting, strlen(greeting));
-    alarm(0);
-
-    if (sent != (ssize_t)strlen(greeting)) {
-        close(fd);
-        return;
-    }
-
-    // Wait for client greeting/ack
-    std::string client_greeting;
-    alarm(5);
-    ssize_t r = recv_line(fd, client_greeting);
+    ssize_t r = recv_line(fd, client_response);
     alarm(0);
     if (r <= 0) {
-        // Timeout or disconnect
         const char *err = "ERROR TO\n";
         write(fd, err, strlen(err));
         close(fd);
         return;
     }
 
-    while (1) {
-        // Generate task
-        int code = (rand() % 4) + 1;
-        int a = randomInt();
-        int b = (code == 4) ? ((randomInt() == 0) ? 1 : randomInt()) : randomInt();
-        if (code == 4 && b == 0) b = 1;
+    // Trim whitespace
+    while (!client_response.empty() && (client_response.back() == '\n' || client_response.back() == '\r'))
+        client_response.pop_back();
 
-        const char *opstr = "add";
-        if (code == 1) opstr = "add";
-        else if (code == 2) opstr = "sub";
-        else if (code == 3) opstr = "mul";
-        else opstr = "div";
+    // Check if client selected binary or text protocol
+    std::string lower = client_response;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
-        char task[128];
-        int task_len = snprintf(task, sizeof(task), "%s %d %d\n", opstr, a, b);
+    if (lower.find("binary tcp 1.1 ok") != std::string::npos) {
+        handle_binary_protocol(fd);
+    } else if (lower.find("text tcp 1.1 ok") != std::string::npos) {
+        handle_text_protocol(fd);
+    } else {
+        // Unsupported protocol
+        const char *err = "ERROR: MISSMATCH PROTOCOL\n";
+        write(fd, err, strlen(err));
+        close(fd);
+    }
+}
 
+void handle_text_protocol(int fd) {
+    // Generate and send assignment
+    int code = (rand() % 4) + 1;
+    int a = randomInt();
+    int b = (code == 4) ? ((randomInt() == 0) ? 1 : randomInt()) : randomInt();
+    if (code == 4 && b == 0) b = 1;
+
+    const char *opstr = "add";
+    if (code == 1) opstr = "add";
+    else if (code == 2) opstr = "sub";
+    else if (code == 3) opstr = "mul";
+    else opstr = "div";
+
+    char task[128];
+    int task_len = snprintf(task, sizeof(task), "ASSIGNMENT: %s %d %d\n", opstr, a, b);
+
+    alarm(5);
+    ssize_t sent = write(fd, task, task_len);
+    alarm(0);
+    if (sent != task_len) {
+        close(fd);
+        return;
+    }
+
+    // Wait for answer
+    std::string line;
+    alarm(5);
+    ssize_t r = recv_line(fd, line);
+    alarm(0);
+    if (r <= 0) {
+        const char *err = "ERROR TO\n";
+        write(fd, err, strlen(err));
+        close(fd);
+        return;
+    }
+
+    // Trim newline
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+        line.pop_back();
+
+    // Calculate expected result
+    int expected = 0;
+    if (code == 1) expected = a + b;
+    else if (code == 2) expected = a - b;
+    else if (code == 3) expected = a * b;
+    else if (code == 4) expected = a / b;
+
+    // Parse and validate answer
+    line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
+
+    bool ok = false;
+    int answer_int = 0;
+    double answer_double = 0.0;
+
+    // Try integer first
+    if (sscanf(line.c_str(), "%d", &answer_int) == 1) {
+        if (answer_int == expected) ok = true;
+    } else if (sscanf(line.c_str(), "%lf", &answer_double) == 1) {
+        if (fabs(answer_double - expected) < 0.0001) ok = true;
+    }
+
+    if (ok) {
+        char result[64];
+        snprintf(result, sizeof(result), "OK (myresult=%d)\n", answer_int);
         alarm(5);
-        ssize_t sent = write(fd, task, task_len);
+        write(fd, result, strlen(result));
         alarm(0);
-        if (sent != task_len) break;
-
-        // Wait for answer
-        std::string line;
+    } else {
         alarm(5);
-        ssize_t r = recv_line(fd, line);
+        write(fd, "ERROR\n", 6);
         alarm(0);
-        if (r <= 0) {
-            // Timeout or disconnect
-            const char *err = "ERROR TO\n";
-            write(fd, err, strlen(err));
-            break;
-        }
+    }
+    close(fd);
+}
 
-        // Trim newline
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-            line.pop_back();
+void handle_binary_protocol(int fd) {
+    // Generate task
+    int code = (rand() % 4) + 1;
+    int i1 = randomInt();
+    int i2;
+    if (code == 4) {
+        do { i2 = randomInt(); } while (i2 == 0);
+    } else {
+        i2 = randomInt();
+    }
 
-        // Calculate expected result
-        int expected = 0;
-        if (code == 1) expected = a + b;
-        else if (code == 2) expected = a - b;
-        else if (code == 3) expected = a * b;
-        else if (code == 4) expected = a / b;
+    int32_t expected = 0;
+    if (code == 1) expected = i1 + i2;
+    else if (code == 2) expected = i1 - i2;
+    else if (code == 3) expected = i1 * i2;
+    else if (code == 4) expected = i1 / i2;
 
-        // Parse and validate answer
-        line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
+    uint32_t task_id = (uint32_t)(rand() ^ time(NULL));
 
-        bool ok = false;
-        int answer_int = 0;
-        double answer_double = 0.0;
+    // For TCP Binary, send calcProtocol message directly (no text assignment line)
+    calcProtocol cp{};
+    cp.type = htons(1);  // server to client
+    cp.major_version = htons(1);
+    cp.minor_version = htons(1);
+    cp.id = htonl(task_id);
+    cp.arith = htonl(code);
+    cp.inValue1 = htonl(i1);
+    cp.inValue2 = htonl(i2);
+    cp.inResult = htonl(0);
 
-        // Try integer first
-        if (sscanf(line.c_str(), "%d", &answer_int) == 1) {
-            if (answer_int == expected) ok = true;
-        } else if (sscanf(line.c_str(), "%lf", &answer_double) == 1) {
-            if (fabs(answer_double - expected) < 0.0001) ok = true;
-        }
+    alarm(5);
+    ssize_t sent = write(fd, &cp, sizeof(cp));
+    alarm(0);
+    if (sent != sizeof(cp)) {
+        close(fd);
+        return;
+    }
 
-        if (ok) {
-            alarm(5);
-            write(fd, "OK\n", 3);
-            alarm(0);
-        } else {
-            alarm(5);
-            write(fd, "NOT OK\n", 7);
-            alarm(0);
-        }
+    // Wait for client response
+    calcProtocol response;
+    alarm(5);
+    ssize_t r = full_read(fd, &response, sizeof(response));
+    alarm(0);
+    if (r != sizeof(response)) {
+        const char *err = "ERROR TO\n";
+        write(fd, err, strlen(err));
+        close(fd);
+        return;
+    }
+
+    // Convert to host order
+    uint16_t resp_type = ntohs(response.type);
+    uint32_t resp_id = ntohl(response.id);
+    int32_t resp_result = ntohl(response.inResult);
+
+    // Send response
+    calcMessage msg{};
+    msg.type = htons(2);  // server to client
+    msg.protocol = htons(6);  // TCP
+    msg.major_version = htons(1);
+    msg.minor_version = htons(1);
+
+    if (resp_type == 2 && resp_id == task_id && resp_result == expected) {
+        msg.message = htonl(1);  // OK
+        alarm(5);
+        write(fd, &msg, sizeof(msg));
+        alarm(0);
+
+        // Send human-readable OK line for compatibility
+        char okline[64];
+        snprintf(okline, sizeof(okline), "OK (myresult=%d)\n", resp_result);
+        alarm(5);
+        write(fd, okline, strlen(okline));
+        alarm(0);
+    } else {
+        msg.message = htonl(2);  // NOT OK
+        alarm(5);
+        write(fd, &msg, sizeof(msg));
+        alarm(0);
+
+        char nokline[64];
+        snprintf(nokline, sizeof(nokline), "ERROR\n");
+        alarm(5);
+        write(fd, nokline, strlen(nokline));
+        alarm(0);
     }
     close(fd);
 }
@@ -427,122 +390,9 @@ int main(int argc, char *argv[]) {
             continue;
         } else if (pid == 0) {
             close(listenfd);
-
-            const size_t MAX_PEEK = std::max(sizeof(calcProtocol), (size_t)256);
-            std::vector<char> peekbuf(MAX_PEEK);
-
-            struct pollfd pfd;
-            pfd.fd = connfd;
-            pfd.events = POLLIN;
-            pfd.revents = 0;
-
-            int pol = poll(&pfd, 1, 0); // immediate check
-            if (pol < 0) {
-                perror("poll");
-                close(connfd);
-                _exit(1);
-            }
-            if (pol == 0) {
-                // no data now -> assume TEXT
-                fprintf(stderr, "protocol-detect: no data -> TEXT\n");
-                handle_text_client(connfd);
-                _exit(0);
-            }
-            if (!(pfd.revents & POLLIN)) {
-                fprintf(stderr, "protocol-detect: unexpected revents=0x%x\n", pfd.revents);
-                close(connfd);
-                _exit(1);
-            }
-
-            // Peek
-            ssize_t r = recv(connfd, peekbuf.data(), (int)peekbuf.size(), MSG_PEEK);
-            if (r <= 0) { close(connfd); _exit(0); }
-            size_t got = (size_t)r;
-
             
-
-            // convert peek to lowercase string for token search (safe even if non-printable)
-            std::string peekstr(peekbuf.data(), peekbuf.data() + got);
-            std::string lower = peekstr;
-            std::transform(lower.begin(), lower.end(), lower.begin(),
-                        [](unsigned char c){ return std::tolower(c); });
-
-            fprintf(stderr, "protocol-detect: peeked %zu bytes: ", got);
-            for (size_t i = 0; i < got; ++i) fprintf(stderr, "%02x ", (unsigned char)peekbuf[i]);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "protocol-detect: peekstr: '%.100s'\n", peekstr.c_str());
-
-            // If the token "binary" appears anywhere in the peeked bytes -> treat as request for binary
-            if (lower.find("binary") != std::string::npos) {
-                // ---------- REPLACED BLOCK: consume only the first line (up to newline) ----------
-                // find position of first newline in the peeked buffer
-                size_t nlpos = std::string::npos;
-                for (size_t i = 0; i < got; ++i) {
-                    if (peekbuf[i] == '\n') { nlpos = i; break; }
-                }
-
-                if (nlpos == std::string::npos) {
-                    // We found 'binary' but didn't see a newline in the peek buffer.
-                    // Best option: try to read until we encounter newline, but only a bounded amount
-                    // so we don't block forever. Use ioctl(FIONREAD) to know how many bytes can be read without blocking.
-                    int avail = 0;
-                    if (ioctl(connfd, FIONREAD, &avail) == -1) avail = 0;
-                    if (avail > 0) {
-                        // read what's available (but this is a fallback; ideally newline is in the peek)
-                        std::vector<char> tmp((size_t)avail);
-                        ssize_t rr = read(connfd, tmp.data(), avail);
-                        (void)rr;
-                    }
-                    fprintf(stderr, "protocol-detect: token 'binary' but no newline in peek; performed fallback read(%d)\n", avail);
-                } else {
-                    // consume exactly nlpos+1 bytes (include the newline)
-                    size_t to_consume = nlpos + 1;
-                    size_t consumed = 0;
-                    while (consumed < to_consume) {
-                        ssize_t rn = read(connfd, peekbuf.data(), (int)std::min(peekbuf.size(), to_consume - consumed));
-                        if (rn <= 0) break; // should not block because we peeked the bytes earlier
-                        consumed += (size_t)rn;
-                    }
-                    fprintf(stderr, "protocol-detect: consumed first line (%zu bytes): '%.100s'\n",
-                            consumed, std::string(peekbuf.data(), peekbuf.data() + std::min((size_t)consumed, (size_t)100)).c_str());
-                }
-                // ------------------------------------------------------------------------------
-
-                fprintf(stderr, "protocol-detect: switching to BINARY handler (connfd=%d)\n", connfd);
-                handle_binary_client(connfd);
-                _exit(0);
-            }
-
-            // If the peek looks printable and contains newline but no 'binary' token, assume text
-            bool has_newline = (peekstr.find('\n') != std::string::npos);
-            bool all_print = true;
-            for (size_t i = 0; i < got; ++i) {
-                unsigned char c = static_cast<unsigned char>(peekbuf[i]);
-                if (c != '\n' && c != '\r' && (c < 0x20 || c > 0x7E)) { all_print = false; break; }
-            }
-            if (has_newline && all_print) {
-                fprintf(stderr, "protocol-detect: printable ASCII line (no binary token) -> TEXT\n");
-                handle_text_client(connfd);
-                _exit(0);
-            }
-
-            // Otherwise, if we have at least a full binary header, validate it
-            if (got >= sizeof(calcProtocol)) {
-                calcProtocol tmp;
-                memcpy(&tmp, peekbuf.data(), sizeof(tmp));
-                uint16_t type = ntohs(tmp.type);
-                uint16_t maj  = ntohs(tmp.major_version);
-                uint16_t min  = ntohs(tmp.minor_version);
-                if ((type == 21 || type == 22) && maj == 1 && min == 1) {
-                    fprintf(stderr, "protocol-detect: validated binary header -> BINARY\n");
-                    handle_binary_client(connfd);
-                    _exit(0);
-                }
-            }
-
-            // Undecided / partial header: default to TEXT immediately (tests expect immediate greeting)
-            fprintf(stderr, "protocol-detect: undecided/partial -> default TEXT\n");
-            handle_text_client(connfd);
+            // TCP protocol: Server sends list of supported protocols first
+            handle_tcp_client(connfd);
             _exit(0);
         } else {
             close(connfd);
