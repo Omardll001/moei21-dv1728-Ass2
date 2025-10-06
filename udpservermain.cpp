@@ -203,7 +203,7 @@ int main(int argc, char *argv[]) {
                 cp_host.inValue2 = ntohl(cp_net.inValue2);
                 cp_host.inResult = ntohl(cp_net.inResult);
 
-                
+
                 if (is_valid_binary_protocol(cp_host)) {
                     if (!client_exists) {
                         // New binary client - send task
@@ -309,24 +309,28 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            // Treat as text protocol
+            // Treat as text protocol or mixed protocol
             std::string s(buf, n);
             while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) 
                 s.pop_back();
 
             if (!client_exists) {
-                // New text client - send task
-                int code = (rand() % 4) + 1;
-                int a = randomInt();
-                int b = (code == 4) ? ((randomInt() == 0) ? 1 : randomInt()) : randomInt();
-                if (code == 4 && b == 0) b = 1;
+                // Check if this is protocol negotiation that expects binary response
+                bool expect_binary_response = (s.find("TEXT UDP") != std::string::npos ||
+                                               s.find("BINARY UDP") != std::string::npos ||
+                                               n <= 15); // Short messages likely protocol negotiation
                 
-                int expected = 0;
-                const char *opstr = "add";
-                if (code == 1) { expected = a + b; opstr = "add"; }
-                else if (code == 2) { expected = a - b; opstr = "sub"; }
-                else if (code == 3) { expected = a * b; opstr = "mul"; }
-                else { expected = a / b; opstr = "div"; }
+                // New client - send task
+                uint32_t code = (rand() % 4) + 1;
+                int32_t a = randomInt();
+                int32_t b = randomInt();
+                if (code == 4 && b == 0) b = 1;  // Avoid division by zero
+                
+                int32_t expected = 0;
+                if (code == 1) expected = a + b;
+                else if (code == 2) expected = a - b;
+                else if (code == 3) expected = a * b;
+                else if (code == 4) expected = a / b;
                 
                 uint32_t id = (uint32_t)(rand() ^ time(NULL));
                 ClientState cs{};
@@ -337,42 +341,101 @@ int main(int argc, char *argv[]) {
                 cs.arith = code; 
                 cs.timestamp = now; 
                 cs.waiting = true; 
-                cs.is_binary = false;
+                cs.is_binary = expect_binary_response;
                 
                 clients[key] = cs;
                 
-                char outmsg[128];
-                int len = snprintf(outmsg, sizeof(outmsg), "%u %s %d %d\n", id, opstr, a, b);
-                sendto(sockfd, outmsg, len, 0, (struct sockaddr*)&cliaddr, clilen);
+                if (expect_binary_response) {
+                    // Send binary protocol response (calcProtocol)
+                    calcProtocol out{};
+                    out.type = 1; 
+                    out.major_version = 1; 
+                    out.minor_version = 1;
+                    out.id = id; 
+                    out.arith = code; 
+                    out.inValue1 = a; 
+                    out.inValue2 = b; 
+                    out.inResult = 0;
+                    
+                    send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                } else {
+                    // Send text protocol response
+                    const char *opstr = "add";
+                    if (code == 1) opstr = "add";
+                    else if (code == 2) opstr = "sub";
+                    else if (code == 3) opstr = "mul";
+                    else opstr = "div";
+                    
+                    char outmsg[128];
+                    int len = snprintf(outmsg, sizeof(outmsg), "%u %s %d %d\n", id, opstr, a, b);
+                    sendto(sockfd, outmsg, len, 0, (struct sockaddr*)&cliaddr, clilen);
+                }
             } else {
-                // Existing text client - validate answer
+                // Existing client - validate answer
                 ClientState &cs = it->second;
-                uint32_t id = 0; 
-                int32_t res = 0;
                 
-                if (sscanf(s.c_str(), "%u %d", &id, &res) == 2) {
-                    if (id != cs.task_id) {
-                        const char *nok = "NOT OK\n";
-                        sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
-                    } else {
-                        if ((now - cs.timestamp) > 10) {
-                            const char *late = "NOT OK\n";
-                            sendto(sockfd, late, strlen(late), 0, (struct sockaddr*)&cliaddr, clilen);
-                            clients.erase(it);
+                if (cs.is_binary) {
+                    // Handle as binary protocol response (even if message looks like text)
+                    if (n == sizeof(calcProtocol)) {
+                        calcProtocol cp_net;
+                        memcpy(&cp_net, buf, sizeof(calcProtocol));
+                        calcProtocol cp_host;
+                        cp_host.type = ntohs(cp_net.type);
+                        cp_host.major_version = ntohs(cp_net.major_version);
+                        cp_host.minor_version = ntohs(cp_net.minor_version);
+                        cp_host.id = ntohl(cp_net.id);
+                        cp_host.arith = ntohl(cp_net.arith);
+                        cp_host.inValue1 = ntohl(cp_net.inValue1);
+                        cp_host.inValue2 = ntohl(cp_net.inValue2);
+                        cp_host.inResult = ntohl(cp_net.inResult);
+                        
+                        if (cp_host.id != cs.task_id) {
+                            send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                        } else if ((now - cs.timestamp) > 10) {
+                            send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
                         } else {
-                            if (res == cs.expected) {
-                                const char *ok = "OK\n";
-                                sendto(sockfd, ok, strlen(ok), 0, (struct sockaddr*)&cliaddr, clilen);
+                            int32_t received_result = (int32_t)cp_host.inResult;
+                            if (received_result == cs.expected) {
+                                send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 1);
                             } else {
-                                const char *nok = "NOT OK\n";
-                                sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                                send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
                             }
-                            clients.erase(it);
                         }
+                        clients.erase(it);
+                    } else {
+                        // Wrong size for binary protocol
+                        send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                        clients.erase(it);
                     }
                 } else {
-                    const char *err = "ERROR PARSE\n";
-                    sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+                    // Handle as text protocol
+                    uint32_t id = 0; 
+                    int32_t res = 0;
+                    
+                    if (sscanf(s.c_str(), "%u %d", &id, &res) == 2) {
+                        if (id != cs.task_id) {
+                            const char *nok = "NOT OK\n";
+                            sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                        } else {
+                            if ((now - cs.timestamp) > 10) {
+                                const char *late = "NOT OK\n";
+                                sendto(sockfd, late, strlen(late), 0, (struct sockaddr*)&cliaddr, clilen);
+                                clients.erase(it);
+                            } else {
+                                if (res == cs.expected) {
+                                    const char *ok = "OK\n";
+                                    sendto(sockfd, ok, strlen(ok), 0, (struct sockaddr*)&cliaddr, clilen);
+                                } else {
+                                    const char *nok = "NOT OK\n";
+                                    sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                                }
+                                clients.erase(it);
+                            }
+                        }
+                    } else {
+                        const char *err = "ERROR PARSE\n";
+                        sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+                    }
                 }
             }
         }
