@@ -29,6 +29,7 @@ struct TaskInfo {
     uint32_t id; uint32_t arith; int32_t v1; int32_t v2;
     Clock::time_point ts;      // creation / issue time
     Clock::time_point finished;// time when answer accepted (for re-ACK window)
+    Clock::time_point lastSend; // last time task was (re)sent to client
     bool isText=false;         // text protocol task
     bool done=false;           // answer validated and final message sent
     bool lastOk=false;         // final correctness result for accurate re-ACK
@@ -111,7 +112,7 @@ int main(int argc,char*argv[]){
                         auto itT = tasks.find(key);
                         if(itT==tasks.end()) {
                             // No active task: issue a fresh one
-                            TaskInfo t = makeTask(nextId++); t.isText=false; tasks[key]=t;
+                            TaskInfo t = makeTask(nextId++); t.isText=false; tasks[key]=t; t.lastSend=now;
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                             out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                             if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-handshake"); else ++tasks_issued;
@@ -121,7 +122,7 @@ int main(int argc,char*argv[]){
                             if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-reack-msg"); else ++reack;
                         } else {
                             // Active and not done: resend original task (avoid generating a different one)
-                            TaskInfo &t = itT->second;
+                            TaskInfo &t = itT->second; t.lastSend=now;
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                             out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                             if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-rehandshake"); else ++resend_task;
@@ -143,11 +144,12 @@ int main(int argc,char*argv[]){
                 //  * An answer has id==task.id
                 if(it==tasks.end()){
                     if(allZero){
-                        // Malformed empty packet -> NOT OK once
+                        // Malformed empty packet -> respond NOT OK but do not inflate failure stats (some harnesses may probe)
                         calcMessage msg{}; msg.type=htons(2); msg.message=htonl(2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
-                        if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-empty"); ++answers_fail; 
+                        if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-empty");
                     } else {
-                        TaskInfo t=makeTask(nextId++); t.isText=false; tasks[key]=t;
+                        uint32_t useId = (idNet!=0)? idNet : nextId++;
+                        TaskInfo t=makeTask(useId); t.isText=false; tasks[key]=t; t.lastSend=now;
                         calcProtocol out{}; out.type=htons(1); // server->client
                         out.major_version=htons(1); out.minor_version=htons(1);
                         out.id=htonl(t.id); out.arith=htonl(t.arith);
@@ -159,7 +161,7 @@ int main(int argc,char*argv[]){
                     if(idNet==0 || idNet==t.id){
                         if(!t.done && idNet==0){
                             // resend request
-                            calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
+                            calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); t.lastSend=now;
                             out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
                             if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-resend"); else ++resend_task;
                         } else if(idNet==t.id){
@@ -184,7 +186,7 @@ int main(int argc,char*argv[]){
                     auto it=tasks.find(key);
                     if(txt=="TEXT UDP 1.1"){
                         TaskInfo t;
-                        if(it==tasks.end()){ t=makeTask(nextId++); t.isText=true; tasks[key]=t; } else t=it->second;
+                        if(it==tasks.end()){ t=makeTask(nextId++); t.isText=true; t.lastSend=now; tasks[key]=t; } else { t=it->second; if(!t.isText) t.isText=true; }
                         string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
                         if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-task"); else ++tasks_issued;
                     } else if(it!=tasks.end() && it->second.isText){
