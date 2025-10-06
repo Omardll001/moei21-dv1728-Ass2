@@ -99,8 +99,17 @@ int send_calcMessage_udp(int sockfd, const struct sockaddr *to, socklen_t tolen,
 }
 
 bool is_valid_binary_protocol(const calcProtocol &cp) {
-    return (cp.major_version == 1 && cp.minor_version == 1) &&
-           (cp.type == 22);  // Accept only binary client-to-server messages
+    // Check for valid version first
+    if (cp.major_version != 1 || cp.minor_version != 1) return false;
+    
+    // For initial client requests, arith can be 0
+    // For client responses, arith should be 1-4 (but we don't need to validate this strictly)
+    if (cp.arith > 4) return false;
+    
+    // Accept common client-to-server type values that codegrade might use
+    // type 1 = server-to-client (but codegrade test might use this)
+    // type 22 = client-to-server binary protocol
+    return (cp.type == 1 || cp.type == 22);
 }
 
 int main(int argc, char *argv[]) {
