@@ -24,14 +24,16 @@ using Clock = chrono::steady_clock;
 
 struct TaskInfo {
     uint32_t id; uint32_t arith; int32_t v1; int32_t v2;
-    Clock::time_point ts;      // creation / issue time
-    Clock::time_point finished;// when answer accepted
-    bool isText=false;         // text protocol task
-    bool done=false;           // answer validated
-    bool lastOk=false;         // final correctness
+    Clock::time_point ts;       // creation / issue time
+    Clock::time_point finished; // when answer accepted
+    bool isText=false;          // text protocol task
+    bool done=false;            // answer validated
+    bool lastOk=false;          // final correctness
     Clock::time_point lastSend; // last time the task was (re)sent
     int resendCount=0;          // proactive resend attempts
     int sockfd=-1;              // socket used for this client's address
+    bool stuckLogged=false;     // whether we already logged STUCK
+    bool timeoutLogged=false;   // whether we already logged CLIENT_TIMEOUT
 };
 struct ClientKey { sockaddr_storage addr{}; socklen_t len{}; bool operator==(ClientKey const& o) const noexcept { if(len!=o.len) return false; if(addr.ss_family!=o.addr.ss_family) return false; if(addr.ss_family==AF_INET){auto *a=(sockaddr_in*)&addr;auto *b=(sockaddr_in*)&o.addr; return a->sin_port==b->sin_port && a->sin_addr.s_addr==b->sin_addr.s_addr;} else {auto *a=(sockaddr_in6*)&addr;auto *b=(sockaddr_in6*)&o.addr; return a->sin6_port==b->sin6_port && memcmp(&a->sin6_addr,&b->sin6_addr,sizeof(in6_addr))==0;} } };
 struct ClientHash { size_t operator()(ClientKey const& k) const noexcept { size_t h=0xcbf29ce484222325ULL; auto mix=[&](const void* d,size_t l){auto p=(const unsigned char*)d; for(size_t i=0;i<l;++i){h^=p[i]; h*=0x100000001b3ULL;}}; if(k.addr.ss_family==AF_INET){auto *a=(sockaddr_in*)&k.addr; mix(&a->sin_port,sizeof(a->sin_port)); mix(&a->sin_addr,sizeof(a->sin_addr));} else {auto *a=(sockaddr_in6*)&k.addr; mix(&a->sin6_port,sizeof(a->sin6_port)); mix(&a->sin6_addr,sizeof(a->sin6_addr));} return h; } };
@@ -98,6 +100,7 @@ int main(int argc,char*argv[]){
     if(socks.empty()){ cerr<<"bind failed\n"; return 1; }
     cout<<"udpserver running on "<<host<<":"<<port<<" sockets="<<socks.size(); if(debug){ cout<<" DEBUG=on"; if(trace) cout<<" TRACE=on"; } cout<<"\n"; cout.flush();
     unordered_map<ClientKey,TaskInfo,ClientHash> tasks; uint32_t nextId=1;
+    unordered_map<uint32_t,ClientKey> idToClient; // id -> client key for port-move recovery
     // Diagnostics counters (debug only)
     size_t pkt_recv=0, pkt_binary=0, pkt_text=0, tasks_issued=0, answers_ok=0, answers_fail=0, resend_task=0, reack=0;
     auto lastDiag = Clock::now();
@@ -117,7 +120,7 @@ int main(int argc,char*argv[]){
                 if(age>10) { it = tasks.erase(it); continue; }
             } else {
                 auto doneAge = chrono::duration_cast<chrono::milliseconds>(now - it->second.finished).count();
-                if(doneAge > 2000) { it = tasks.erase(it); continue; }
+                if(doneAge > 2000) { idToClient.erase(it->second.id); it = tasks.erase(it); continue; }
             }
             ++it;
         }
@@ -157,8 +160,8 @@ int main(int argc,char*argv[]){
                         if(itT==tasks.end()){
                             // Capacity guard: avoid unbounded growth if clients churn ports
                             size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
-                            if(activePending>=110) { if(trace) cout<<"EV DROP newtask-cap bin(handshake) addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; continue; }
-                            TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t;
+                            if(activePending>=500) { if(trace) cout<<"EV DROP newtask-cap bin(handshake) addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; continue; }
+                            TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t; idToClient[t.id]=key;
                             if(debug) cout<<"EV NEWTASK bin(handshake) id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                             out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
@@ -166,13 +169,13 @@ int main(int argc,char*argv[]){
                         } else if(itT->second.done){
                             // Instead of only re-ACK, give a new task so client can progress
                             size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
-                            if(activePending>=110) {
+                            if(activePending>=500) {
                                 if(trace) cout<<"EV DROP newtask-cap bin(handshake-after-done) addr="<<addrToString(caddr)<<" active="<<activePending<<"\n";
                                 // still send re-ack so client knows status
                                 calcMessage msg{}; msg.type=htons(2); msg.message=htonl(itT->second.lastOk?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
                                 sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen);
                             } else {
-                                TaskInfo nt=makeTask(nextId++); nt.isText=false; nt.lastSend=Clock::now(); nt.sockfd=s; tasks[key]=nt;
+                                TaskInfo nt=makeTask(nextId++); nt.isText=false; nt.lastSend=Clock::now(); nt.sockfd=s; tasks[key]=nt; idToClient[nt.id]=key;
                                 if(debug) cout<<"EV NEWTASK bin(handshake-after-done) id="<<nt.id<<" prev="<<itT->second.id<<" ok="<<itT->second.lastOk<<" addr="<<addrToString(caddr)<<"\n";
                                 calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                                 out.id=htonl(nt.id); out.arith=htonl(nt.arith); out.inValue1=htonl(nt.v1); out.inValue2=htonl(nt.v2); out.inResult=0;
@@ -204,10 +207,32 @@ int main(int argc,char*argv[]){
                 uint32_t idNet=ntohl(cp.id);
                 int32_t inRes=ntohl(cp.inResult);
                 if(it==tasks.end()){
+                    // Attempt port-move recovery using id mapping (only if non-zero id)
+                    if(idNet!=0){
+                        auto f = idToClient.find(idNet);
+                        if(f!=idToClient.end()){
+                            auto itOld = tasks.find(f->second);
+                            if(itOld!=tasks.end()){
+                                // Verify same host (IP) but different port
+                                bool sameHost=true; bool portChanged=false;
+                                if(f->second.addr.ss_family!=key.addr.ss_family) sameHost=false; else if(key.addr.ss_family==AF_INET){
+                                    auto *a=(sockaddr_in*)&f->second.addr; auto *b=(sockaddr_in*)&key.addr; sameHost = (a->sin_addr.s_addr==b->sin_addr.s_addr); portChanged = (a->sin_port!=b->sin_port);
+                                } else {
+                                    auto *a=(sockaddr_in6*)&f->second.addr; auto *b=(sockaddr_in6*)&key.addr; sameHost = memcmp(&a->sin6_addr,&b->sin6_addr,sizeof(in6_addr))==0; portChanged = (a->sin6_port!=b->sin6_port);
+                                }
+                                if(sameHost){
+                                    TaskInfo moved = itOld->second; tasks.erase(itOld); tasks[key]=moved; idToClient[moved.id]=key; it=tasks.find(key);
+                                    if(trace) cout<<"EV PORTMOVE id="<<moved.id<<" new="<<addrToString(key.addr)<<" portChanged="<<portChanged<<"\n";
+                                }
+                            }
+                        }
+                    }
+                }
+                if(it==tasks.end()){
                     if(idNet==0){
                         size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
-                        if(activePending>=110) { if(trace) cout<<"EV DROP newtask-cap bin addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
-                        else { TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t;
+                        if(activePending>=500) { if(trace) cout<<"EV DROP newtask-cap bin addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
+                        else { TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t; idToClient[t.id]=key;
                         if(debug) cout<<"EV NEWTASK bin id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                         calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                         out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
@@ -226,9 +251,10 @@ int main(int argc,char*argv[]){
                             if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-resend"); else ++resend_task;
                             t.lastSend=Clock::now();
                         } else if(idNet==t.id){
-                            // answer
+                            // answer processing
                             auto age=chrono::duration_cast<chrono::seconds>(now - t.ts).count();
                             int32_t real=eval(t);
+                            if(trace) cout<<"EV PROCESS_ANSWER id="<<t.id<<" inRes="<<inRes<<" expect="<<real<<" age="<<age<<" resendCount="<<t.resendCount<<"\n";
                             calcMessage msg{}; msg.type=htons(2); bool ok=(age<=10)&&(inRes==real);
                             msg.message=htonl(ok?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
                             if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-answer");
@@ -241,7 +267,7 @@ int main(int argc,char*argv[]){
                     } else {
                         if(idNet==0){
                             // new task request after completion
-                            TaskInfo nt=makeTask(nextId++); nt.isText=false; nt.lastSend=Clock::now(); nt.sockfd=s; tasks[key]=nt;
+                            TaskInfo nt=makeTask(nextId++); nt.isText=false; nt.lastSend=Clock::now(); nt.sockfd=s; tasks[key]=nt; idToClient[nt.id]=key;
                             if(debug) cout<<"EV NEWTASK bin(after-done) id="<<nt.id<<" prev="<<t.id<<" ok="<<t.lastOk<<" addr="<<addrToString(caddr)<<"\n";
                             calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                             out.id=htonl(nt.id); out.arith=htonl(nt.arith); out.inValue1=htonl(nt.v1); out.inValue2=htonl(nt.v2); out.inResult=0;
@@ -266,8 +292,8 @@ int main(int argc,char*argv[]){
                     if(txt=="TEXT UDP 1.1"){
                         if(it==tasks.end() || it->second.done){
                             size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
-                            if(activePending>=110) { if(trace) cout<<"EV DROP newtask-cap text addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
-                            else { TaskInfo t=makeTask(nextId++); t.isText=true; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t;
+                            if(activePending>=500) { if(trace) cout<<"EV DROP newtask-cap text addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
+                            else { TaskInfo t=makeTask(nextId++); t.isText=true; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t; idToClient[t.id]=key;
                             if(debug) cout<<"EV NEWTASK text id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
                             string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
                             if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-task"); else ++tasks_issued; }
@@ -311,8 +337,8 @@ int main(int argc,char*argv[]){
             TaskInfo &t = kv.second; if(t.done) continue; auto ms=chrono::duration_cast<chrono::milliseconds>(nowPR - t.lastSend).count();
             auto ageS = chrono::duration_cast<chrono::seconds>(nowPR - t.ts).count();
             if(ageS>=10) continue; // nearing cleanup
-            int base = (t.resendCount < 5 ? 250 : 400);
-            int jitter = ((int)t.id * 31 + t.resendCount * 17) % 40; // 0..39ms
+            int base = (t.resendCount < 5 ? 500 : 800); // slower resend cadence to reduce storm
+            int jitter = ((int)t.id * 131 + t.resendCount * 67) % 100; // 0..99ms
             int target = base + jitter;
             if(ms>=target){
                 int useSock = (t.sockfd>=0)? t.sockfd : (socks.empty()? -1 : socks[0]);
@@ -337,6 +363,12 @@ int main(int argc,char*argv[]){
             for(int i=0;i<shown;++i){ if(i) cout<<","; cout<<waveIds[i]; }
             if((int)waveIds.size()>shown) cout<<"...";
             cout<<" resendRange="<<minR<<"-"<<maxR<<"\n";
+        }
+        // STUCK / TIMEOUT diagnostics (lightweight, only once per task per level)
+        for(auto &kv: tasks){
+            TaskInfo &t = kv.second; if(t.done) continue; auto ageS=chrono::duration_cast<chrono::seconds>(Clock::now() - t.ts).count();
+            if(!t.stuckLogged && ageS>=3 && t.resendCount>=4){ if(trace) cout<<"EV STUCK id="<<t.id<<" age="<<ageS<<"s resend="<<t.resendCount<<"\n"; t.stuckLogged=true; }
+            if(!t.timeoutLogged && ageS>=6 && t.resendCount>=8){ if(debug) cout<<"EV CLIENT_TIMEOUT id="<<t.id<<" age="<<ageS<<"s resend="<<t.resendCount<<"\n"; t.timeoutLogged=true; }
         }
         auto now2 = Clock::now();
         // Compute pending (not done) tasks for more meaningful 'outstanding'
