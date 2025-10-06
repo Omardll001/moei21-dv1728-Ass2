@@ -10,6 +10,7 @@
 #include <cstring>
 #include <csignal>
 #include <algorithm>
+#include <cstdlib>
 #include <sstream>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -101,6 +102,8 @@ int main(int argc,char*argv[]){
     cout<<"udpserver running on "<<host<<":"<<port<<" sockets="<<socks.size(); if(debug){ cout<<" DEBUG=on"; if(trace) cout<<" TRACE=on"; } cout<<"\n"; cout.flush();
     unordered_map<ClientKey,TaskInfo,ClientHash> tasks; uint32_t nextId=1;
     unordered_map<uint32_t,ClientKey> idToClient; // id -> client key for port-move recovery
+    const auto serverStart = Clock::now();
+    int targetComplete = 100; if(const char *tc=getenv("TARGET_COMPLETE")){ int v=atoi(tc); if(v>0) targetComplete=v; }
     // Diagnostics counters (debug only)
     size_t pkt_recv=0, pkt_binary=0, pkt_text=0, tasks_issued=0, answers_ok=0, answers_fail=0, resend_task=0, reack=0;
     auto lastDiag = Clock::now();
@@ -260,6 +263,8 @@ int main(int argc,char*argv[]){
                             if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-answer");
                             if(debug) cout<<"EV ANSWER bin id="<<t.id<<" ok="<<ok<<" expect="<<real<<" got="<<inRes<<" age="<<age<<" addr="<<addrToString(caddr)<<"\n";
                             if(ok) ++answers_ok; else ++answers_fail; t.done=true; t.finished=Clock::now(); t.lastOk=ok;
+                            if((answers_ok+answers_fail)%10==0){ auto ms=chrono::duration_cast<chrono::milliseconds>(Clock::now()-serverStart).count(); if(debug) cout<<"EV PROGRESS totalAns="<<(answers_ok+answers_fail)<<" ok="<<answers_ok<<" fail="<<answers_fail<<" elapsedMs="<<ms<<"\n"; }
+                            if(answers_ok>=targetComplete){ auto ms=chrono::duration_cast<chrono::milliseconds>(Clock::now()-serverStart).count(); cout<<"EV COMPLETE ok="<<answers_ok<<" fail="<<answers_fail<<" elapsedMs="<<ms<<"\n"; }
                         } else {
                             if(trace) cout<<"EV STRAY bin curId="<<t.id<<" gotId="<<idNet<<" addr="<<addrToString(caddr)<<"\n";
                             // stray answer ignored
@@ -317,6 +322,8 @@ int main(int argc,char*argv[]){
                                 if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-answer");
                                 if(debug) cout<<"EV ANSWER text id="<<it->second.id<<" ok="<<ok<<" expect="<<real<<" got="<<ans<<" addr="<<addrToString(caddr)<<"\n";
                                 if(ok) ++answers_ok; else ++answers_fail; it->second.done=true; it->second.finished=Clock::now(); it->second.lastOk=ok;
+                                if((answers_ok+answers_fail)%10==0){ auto ms=chrono::duration_cast<chrono::milliseconds>(Clock::now()-serverStart).count(); if(debug) cout<<"EV PROGRESS totalAns="<<(answers_ok+answers_fail)<<" ok="<<answers_ok<<" fail="<<answers_fail<<" elapsedMs="<<ms<<"\n"; }
+                                if(answers_ok>=targetComplete){ auto ms=chrono::duration_cast<chrono::milliseconds>(Clock::now()-serverStart).count(); cout<<"EV COMPLETE ok="<<answers_ok<<" fail="<<answers_fail<<" elapsedMs="<<ms<<"\n"; }
                             } else if(parsed){
                                 string resp=string("NOT OK ");
                                 if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-reject");
@@ -334,23 +341,29 @@ int main(int argc,char*argv[]){
         vector<int> waveIds; waveIds.reserve(64);
         auto nowPR = Clock::now();
         for(auto &kv : tasks){
-            TaskInfo &t = kv.second; if(t.done) continue; auto ms=chrono::duration_cast<chrono::milliseconds>(nowPR - t.lastSend).count();
+            TaskInfo &t = kv.second; if(t.done) continue; auto msSince=chrono::duration_cast<chrono::milliseconds>(nowPR - t.lastSend).count();
             auto ageS = chrono::duration_cast<chrono::seconds>(nowPR - t.ts).count();
             if(ageS>=10) continue; // nearing cleanup
-            int base = (t.resendCount < 5 ? 500 : 800); // slower resend cadence to reduce storm
-            int jitter = ((int)t.id * 131 + t.resendCount * 67) % 100; // 0..99ms
-            int target = base + jitter;
-            if(ms>=target){
+            // Adaptive resend schedule: faster early retries, then slow.
+            static const int schedule[] = {120,200,300,400,500,650,800,1000,1200,1500};
+            int idx = t.resendCount; if(idx<0) idx=0; if(idx >= (int)(sizeof(schedule)/sizeof(schedule[0]))) idx = (int)(sizeof(schedule)/sizeof(schedule[0]))-1;
+            int base = schedule[idx];
+            int jitter = ((int)t.id * 97 + t.resendCount * 79) % 60; // 0..59ms jitter
+            int targetMs = base + jitter;
+            // If appears stuck (few resends but large age), shorten delay
+            if(t.resendCount<2 && ageS>=2) targetMs = min(targetMs, 250);
+            // Force resend if we somehow exceeded 2x planned (safety)
+            if(msSince >= targetMs || msSince >= 2*targetMs){
                 int useSock = (t.sockfd>=0)? t.sockfd : (socks.empty()? -1 : socks[0]);
                 if(useSock<0) continue;
                 const sockaddr_storage &caddr = kv.first.addr; socklen_t clen = kv.first.len;
                 if(t.isText){
                     string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
-                    if(sendto(useSock,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-proactive-text"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; waveIds.push_back(t.id); }
+                    if(sendto(useSock,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-proactive-text"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; waveIds.push_back(t.id); if(trace) cout<<"EV ADAPT_RESEND text id="<<t.id<<" delayMs="<<msSince<<" sched="<<targetMs<<" rc="<<t.resendCount<<"\n"; }
                 } else {
                     calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
                     out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
-                    if(sendto(useSock,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-proactive-bin"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; waveIds.push_back(t.id); }
+                    if(sendto(useSock,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-proactive-bin"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; waveIds.push_back(t.id); if(trace) cout<<"EV ADAPT_RESEND bin id="<<t.id<<" delayMs="<<msSince<<" sched="<<targetMs<<" rc="<<t.resendCount<<"\n"; }
                 }
             }
         }
