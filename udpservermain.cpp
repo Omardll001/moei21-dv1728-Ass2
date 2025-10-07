@@ -1,4 +1,3 @@
-// Simplified UDP server per teacher feedback:
 // One socket only, minimal output (errors + key points). Protocol: client handshake (calcMessage type 21=text or 22=binary).
 // Server sends a single task (calcProtocol type=1 or text line). Client replies (calcProtocol type=2 or text answer). Server ACK calcMessage type=2.
 // Optional DEBUG mode with detailed packet trace when compiled with -DDEBUG.
@@ -139,16 +138,33 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             if(itClient!=clients.end()){
-                TaskRec &rec=itClient->second; Task &tk=rec.task; size_t sp=msg.find(' '); if(sp!=string::npos){ bool pars=true; uint32_t rid=0; long long ans=0; try{ rid=stoul(msg.substr(0,sp)); ans=stoll(msg.substr(sp+1)); }catch(...){ pars=false; }
+                TaskRec &rec=itClient->second; Task &tk=rec.task; 
+                bool handled=false; 
+                size_t sp=msg.find(' ');
+                if(sp!=string::npos){
+                    bool pars=true; uint32_t rid=0; long long ans=0; try{ rid=stoul(msg.substr(0,sp)); ans=stoll(msg.substr(sp+1)); }catch(...){ pars=false; }
                     if(pars && rid==tk.id && !tk.done){
                         auto age=chrono::duration_cast<chrono::seconds>(Clock::now()-tk.created).count(); bool expired=age>10;
                         bool okAns = (!expired) && (ans==eval(tk));
-                        tk.done=true; tk.ok=okAns;
+                        tk.done=true; tk.ok=okAns; handled=true;
                         string resp=(okAns?"OK ":"NOT OK ");
                         sendto(sock,resp.c_str(),resp.size(),0,(sockaddr*)&ca,clen);
                         DBG(std::cout<<"ANS id="<<tk.id<<" ok="<<okAns<<(expired?" EXPIRED":"")<<" from="<<addrStr(ca)<<"\n");
                         if(okAns) ++ok; else ++fail;
                         clients.erase(key);
+                    }
+                }
+                if(!handled && !tk.done){
+                    // Try interpreting whole msg as just the answer (no id provided)
+                    bool pars=true; long long ans=0; try{ ans=stoll(msg); }catch(...){ pars=false; }
+                    if(pars){
+                        auto age=chrono::duration_cast<chrono::seconds>(Clock::now()-tk.created).count(); bool expired=age>10;
+                        bool okAns = (!expired) && (ans==eval(tk));
+                        tk.done=true; tk.ok=okAns; handled=true;
+                        string resp=(okAns?"OK ":"NOT OK ");
+                        sendto(sock,resp.c_str(),resp.size(),0,(sockaddr*)&ca,clen);
+                        DBG(std::cout<<"ANS id="<<tk.id<<" ok="<<okAns<<(expired?" EXPIRED":"")<<" from="<<addrStr(ca)<<"\n");
+                        if(okAns) ++ok; else ++fail; clients.erase(key);
                     }
                 }
             }
