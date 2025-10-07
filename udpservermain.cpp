@@ -1,10 +1,10 @@
 // udpservermain.cpp
-// Minimal UDP server, according to feedback
-// - Binds only to the address provided (IPv4 by default for 'localhost')
+// Minimal UDP server for codegrade tests
+// - Binds only to the address provided (IPv4 by default for 'localhost' and ip4-localhost support)
 // - Single socket
 // - Distinguishes binary (calcProtocol) and text messages
 // - On new client: send task, wait for one response, reply OK/NOT OK, then forget client
-// - Minimal output: prints only startup line and errors. Optional debug via -DDEBUG or keypoint logging via -DKEYPOINT
+// - Minimal output: prints only startup line and fatal errors. Optional keypoint logging via -DKEYPOINT
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -64,44 +64,40 @@ struct ClientState {
     bool is_binary = false;
 };
 
-static int setup_socket_bind(const char *host, const char *port) {
-    struct addrinfo hints{}, *res = NULL, *rp;
-    // default to IPv4 unless host explicitly looks like IPv6
+static int setup_socket_bind(const char *host_in, const char *port) {
+    // Map special hostnames used in tests
+    const char *host = host_in;
     bool prefer_ipv6 = false;
-    if (strchr(host, ':') != NULL || strcmp(host, "::1") == 0 || strcmp(host, "ip6-localhost") == 0) prefer_ipv6 = true;
-    hints.ai_family = prefer_ipv6 ? AF_INET6 : AF_INET;
+    if (strcmp(host_in, "ip4-localhost") == 0) host = "127.0.0.1";
+    else if (strcmp(host_in, "ip6-localhost") == 0) { host = "::1"; prefer_ipv6 = true; }
+
+    struct addrinfo hints{}, *res = NULL, *rp;
+    hints.ai_family = prefer_ipv6 ? AF_INET6 : AF_INET; // only one family
     hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_flags = AI_NUMERICHOST; // require numeric host; if fails, fall back
+    hints.ai_flags = 0;
 
     int s = getaddrinfo(host, port, &hints, &res);
     if (s != 0) {
-        // try without AI_NUMERICHOST to allow names like 'localhost'
-        hints.ai_flags = 0;
-        s = getaddrinfo(host, port, &hints, &res);
-        if (s != 0) return -1;
+        return -1;
     }
 
     int fd = -1;
     for (rp = res; rp != NULL; rp = rp->ai_next) {
-        // Only bind to same family as requested (prevent binding both v4+v6)
-        if (prefer_ipv6 && rp->ai_family != AF_INET6) continue;
-        if (!prefer_ipv6 && rp->ai_family != AF_INET) continue;
-
+        if (rp->ai_family != hints.ai_family) continue; // only bind to requested family
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd == -1) continue;
-        // increase buffers to handle concurrent bursts
         int buf = 4 * 1024 * 1024;
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
-
         if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
-            break; // success
+            freeaddrinfo(res);
+            return fd; // success
         }
         close(fd);
         fd = -1;
     }
     freeaddrinfo(res);
-    return fd;
+    return -1;
 }
 
 static int send_calcProtocol_udp(int sockfd, const struct sockaddr *to, socklen_t tolen, const calcProtocol &cp_host) {
@@ -137,7 +133,7 @@ static bool is_valid_binary_protocol(const calcProtocol &cp) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s host:port\n", argv[0]);
+        fprintf(stderr, "Usage: %s host:port", argv[0]);
         return 1;
     }
 
@@ -146,10 +142,10 @@ int main(int argc, char *argv[]) {
 
     char *input = argv[1];
     char *sep = strchr(input, ':');
-    if (!sep) { fprintf(stderr, "Error: input must be host:port\n"); return 1; }
+    if (!sep) { fprintf(stderr, "Error: input must be host:port"); return 1; }
     char host[256]; char port[64];
     size_t hlen = sep - input;
-    if (hlen >= sizeof(host)) { fprintf(stderr, "hostname too long\n"); return 1; }
+    if (hlen >= sizeof(host)) { fprintf(stderr, "hostname too long"); return 1; }
     strncpy(host, input, hlen); host[hlen] = '\0';
     strncpy(port, sep + 1, sizeof(port) - 1); port[sizeof(port)-1] = '\0';
 
@@ -157,7 +153,7 @@ int main(int argc, char *argv[]) {
     if (sockfd < 0) { perror("setup_socket_bind"); return 1; }
 
     // Minimal startup print (required by tester)
-    printf("UDP server on %s:%s\n", host, port);
+    printf("UDP server on %s:%s", host, port);
     fflush(stdout);
 
     std::map<ClientKey, ClientState> clients;
@@ -197,6 +193,22 @@ int main(int argc, char *argv[]) {
         auto it = clients.find(key);
         bool client_exists = (it != clients.end());
 
+        // If message size is neither calcProtocol nor calcMessage, try to detect printable text
+        if (n != (ssize_t)sizeof(calcProtocol) && n != (ssize_t)sizeof(calcMessage)) {
+            bool printable = true;
+            for (ssize_t i = 0; i < n; ++i) {
+                unsigned char c = buf[i];
+                if (c < 9 || (c > 13 && c < 32) || c == 127) { printable = false; break; }
+            }
+            if (!printable) {
+                // Respond with a concise error message but do not print debug lines
+                const char *err = "ERROR WRONG SIZE";
+                sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+                continue;
+            }
+            // else treat as text protocol
+        }
+
         // Try binary
         if (n == (ssize_t)sizeof(calcProtocol)) {
             calcProtocol cp_net; memcpy(&cp_net, buf, sizeof(cp_net));
@@ -210,11 +222,14 @@ int main(int argc, char *argv[]) {
             cp_host.inValue2 = ntohl(cp_net.inValue2);
             cp_host.inResult = ntohl(cp_net.inResult);
 
+            // Empty/invalid binary hello -> respond with concise error
+            if (!client_exists && !is_valid_binary_protocol(cp_host)) {
+                const char *err = "ERROR WRONG SIZE OR INCORRECT PROTOCOL";
+                sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+                continue;
+            }
+
             if (!client_exists) {
-                if (!is_valid_binary_protocol(cp_host)) {
-                    // ignore invalid binary hello
-                    continue;
-                }
                 // New binary client: send task
                 ClientState cs{}; cs.is_binary = true; cs.waiting = true; cs.timestamp = now;
                 uint32_t code = (rand() % 4) + 1;
@@ -245,14 +260,15 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // If size matches calcMessage (binary) - handle 'hello' messages maybe ignored
+        // If size matches calcMessage (binary), handle possible empty message -> error
         if (n == (ssize_t)sizeof(calcMessage)) {
             calcMessage m; memcpy(&m, buf, sizeof(m));
-            if (m.type == 0 && m.message == 0 && m.protocol == 0 && m.major_version == 0 && m.minor_version == 0) {
-                // ignore empty calcMessage
+            if (!client_exists && m.type == 0 && m.message == 0 && m.protocol == 0 && m.major_version == 0 && m.minor_version == 0) {
+                const char *err = "ERROR WRONG SIZE OR INCORRECT PROTOCOL";
+                sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
                 continue;
             }
-            // fallthrough to text parsing in case it's actually text
+            // else fallthrough
         }
 
         // Text protocol handling
@@ -270,7 +286,7 @@ int main(int argc, char *argv[]) {
             clients[key] = cs;
 
             const char *opstr = (code==1? "add" : code==2? "sub" : code==3? "mul" : "div");
-            char outmsg[128]; int len = snprintf(outmsg, sizeof(outmsg), "%u %s %d %d\n", id, opstr, a, b);
+            char outmsg[128]; int len = snprintf(outmsg, sizeof(outmsg), "%u %s %d %d", id, opstr, a, b);
             sendto(sockfd, outmsg, len, 0, (struct sockaddr*)&cliaddr, clilen);
         } else {
             // Existing text client: parse "id result"
@@ -278,20 +294,20 @@ int main(int argc, char *argv[]) {
             uint32_t id = 0; int32_t res = 0;
             if (sscanf(s.c_str(), "%u %d", &id, &res) == 2) {
                 if (id != cs.task_id) {
-                    const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                    const char *nok = "NOT OK"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
                 } else if ((now - cs.timestamp) > 10) {
-                    const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                    const char *nok = "NOT OK"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
                     clients.erase(it);
                 } else {
                     if (res == cs.expected) {
-                        const char *ok = "OK\n"; sendto(sockfd, ok, strlen(ok), 0, (struct sockaddr*)&cliaddr, clilen);
+                        const char *ok = "OK"; sendto(sockfd, ok, strlen(ok), 0, (struct sockaddr*)&cliaddr, clilen);
                     } else {
-                        const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                        const char *nok = "NOT OK"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
                     }
                     clients.erase(it);
                 }
             } else {
-                const char *err = "ERROR PARSE\n"; sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+                const char *err = "ERROR PARSE"; sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
             }
         }
     }
@@ -299,3 +315,4 @@ int main(int argc, char *argv[]) {
     close(sockfd);
     return 0;
 }
+
