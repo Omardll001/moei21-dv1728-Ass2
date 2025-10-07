@@ -189,7 +189,15 @@ int main(int argc, char *argv[]) {
         if (n <= 0) continue;
 
         ClientKey key; memset(&key, 0, sizeof(key));
-        memcpy(&key.ss, &cliaddr, sizeof(cliaddr)); key.len = clilen;
+        // Copy only the actual address bytes we received (avoid copying uninitialized padding)
+        if (clilen <= sizeof(key.ss)) {
+            memcpy(&key.ss, &cliaddr, clilen);
+            // zero the remaining bytes to avoid undefined padding differences
+            if (clilen < (ssize_t)sizeof(key.ss)) memset(((char*)&key.ss) + clilen, 0, sizeof(key.ss) - clilen);
+        } else {
+            memcpy(&key.ss, &cliaddr, sizeof(key.ss));
+        }
+        key.len = clilen;
         auto it = clients.find(key);
         bool client_exists = (it != clients.end());
 
