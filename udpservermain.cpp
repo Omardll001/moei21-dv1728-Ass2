@@ -1,209 +1,301 @@
-// One socket only, minimal output (errors + key points). Protocol: client handshake (calcMessage type 21=text or 22=binary).
-// Server sends a single task (calcProtocol type=1 or text line). Client replies (calcProtocol type=2 or text answer). Server ACK calcMessage type=2.
-// Optional DEBUG mode with detailed packet trace when compiled with -DDEBUG.
+// udpservermain.cpp
+// Minimal UDP server, according to feedback
+// - Binds only to the address provided (IPv4 by default for 'localhost')
+// - Single socket
+// - Distinguishes binary (calcProtocol) and text messages
+// - On new client: send task, wait for one response, reply OK/NOT OK, then forget client
+// - Minimal output: prints only startup line and errors. Optional debug via -DDEBUG or keypoint logging via -DKEYPOINT
 
-#include <iostream>
-#include <unordered_map>
-#include <chrono>
-#include <cstring>
-#include <csignal>
-#include <vector>
-#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string>
+#include <time.h>
+#include <vector>
+#include <map>
+
 #include "protocol.h"
+extern "C" {
 #include "calcLib.h"
-
-
-using namespace std; using Clock=chrono::steady_clock;
-static volatile bool g_run=true; void sigint(int){ g_run=false; }
-
-#ifdef DEBUG
-static void debugPacket(const sockaddr_storage &ca, socklen_t clen, ssize_t n, bool isNew){
-    char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
-    if(getnameinfo((const sockaddr*)&ca,clen,hbuf,sizeof(hbuf),sbuf,sizeof(sbuf),NI_NUMERICHOST|NI_NUMERICSERV)==0){
-        std::cout<<"PKT len="<<n<<" from="<<hbuf<<":"<<sbuf<<(isNew?" NEW":"")<<"\n";
-    }
 }
-#define DBG(x) do { x; } while(0)
-#else
-#define DBG(x) do{}while(0)
-#endif
 
+using namespace std;
 
-struct ClientKey{ sockaddr_storage addr{}; socklen_t len{}; bool operator==(ClientKey const&o) const noexcept{ if(addr.ss_family!=o.addr.ss_family) return false; if(addr.ss_family==AF_INET){auto*A=(sockaddr_in*)&addr;auto*B=(sockaddr_in*)&o.addr; return A->sin_addr.s_addr==B->sin_addr.s_addr && A->sin_port==B->sin_port;} auto*A=(sockaddr_in6*)&addr;auto*B=(sockaddr_in6*)&o.addr; return memcmp(&A->sin6_addr,&B->sin6_addr,sizeof(in6_addr))==0 && A->sin6_port==B->sin6_port; }};
-struct ClientHash{ size_t operator()(ClientKey const&k) const noexcept{ size_t h=1469598103934665603ULL; auto mix=[&](const void*d,size_t l){ auto p=(const unsigned char*)d; for(size_t i=0;i<l;++i){ h^=p[i]; h*=1099511628211ULL; } }; if(k.addr.ss_family==AF_INET){ auto*A=(sockaddr_in*)&k.addr; mix(&A->sin_addr,sizeof(A->sin_addr)); mix(&A->sin_port,sizeof(A->sin_port)); } else { auto*A=(sockaddr_in6*)&k.addr; mix(&A->sin6_addr,sizeof(A->sin6_addr)); mix(&A->sin6_port,sizeof(A->sin6_port)); } return h; }};
-
-struct Task { uint32_t id; uint32_t op; int32_t v1; int32_t v2; bool text=false; bool done=false; bool ok=false; Clock::time_point created; };
-static Task makeTask(uint32_t id){ Task t{}; t.id=id; t.op=(randomInt()%4)+1; if(t.op==4){ do{ t.v2=randomInt()%100; }while(t.v2==0); t.v1=randomInt()%100; } else { t.v1=randomInt()%100; t.v2=randomInt()%100; } t.created=Clock::now(); return t; }
-static int32_t eval(const Task&t){ switch(t.op){case 1:return t.v1+t.v2; case 2:return t.v1-t.v2; case 3:return t.v1*t.v2; case 4:return t.v1/t.v2;} return 0; }
-static bool splitAddr(const string&s,string&h,string&p){ auto pos=s.rfind(':'); if(pos==string::npos) return false; h=s.substr(0,pos); p=s.substr(pos+1); return !h.empty() && !p.empty(); }
-
-int main(int argc, char* argv[]) {
-    std::cout.setf(std::ios::unitbuf);
-    if (argc < 2) { std::cerr << "Usage: " << argv[0] << " host:port\n"; return 1; }
-    std::string host, port;
-    if (!splitAddr(argv[1], host, port)) { std::cerr << "Bad host:port\n"; return 1; }
-    if (host == "localhost" || host == "ip4-localhost") host = "127.0.0.1";
-    signal(SIGINT,sigint); initCalcLib();
-    int sock=-1; {
-        // Prefer IPv4 first; fallback to IPv6
-        struct addrinfo hints{}; hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_DGRAM; hints.ai_flags=AI_PASSIVE; struct addrinfo*res=nullptr; if(getaddrinfo(host.c_str(),port.c_str(),&hints,&res)!=0){ perror("getaddrinfo"); return 1; }
-        // First pass: try AF_INET, second pass any
-        for(int pass=0; pass<2 && sock<0; ++pass){
-            for(auto*p=res;p;p=p->ai_next){ if(pass==0 && p->ai_family!=AF_INET) continue; if(pass==1 && p->ai_family==AF_INET) {/* skip already tried set? allow others*/}
-                int s=socket(p->ai_family,p->ai_socktype,p->ai_protocol); if(s<0) continue; int yes=1; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
-                if(bind(s,p->ai_addr,p->ai_addrlen)==0){ sock=s; break; } close(s);
-            }
+struct ClientKey {
+    struct sockaddr_storage ss;
+    socklen_t len;
+    bool operator<(const ClientKey& o) const {
+        if (ss.ss_family != o.ss.ss_family) return ss.ss_family < o.ss.ss_family;
+        if (ss.ss_family == AF_INET) {
+            const auto a = (const struct sockaddr_in*)&ss;
+            const auto b = (const struct sockaddr_in*)&o.ss;
+            uint16_t pa = ntohs(a->sin_port);
+            uint16_t pb = ntohs(b->sin_port);
+            if (pa != pb) return pa < pb;
+            uint32_t ia = ntohl(a->sin_addr.s_addr);
+            uint32_t ib = ntohl(b->sin_addr.s_addr);
+            return ia < ib;
+        } else if (ss.ss_family == AF_INET6) {
+            const auto a = (const struct sockaddr_in6*)&ss;
+            const auto b = (const struct sockaddr_in6*)&o.ss;
+            int cmp = memcmp(&a->sin6_addr, &b->sin6_addr, sizeof(a->sin6_addr));
+            if (cmp != 0) return cmp < 0;
+            uint16_t pa = ntohs(a->sin6_port);
+            uint16_t pb = ntohs(b->sin6_port);
+            return pa < pb;
         }
-        freeaddrinfo(res);
+        return false;
     }
-    if(sock<0){ perror("bind"); return 1; }
-    #ifdef DEBUG
-    auto addrStr=[&](const sockaddr_storage &sa)->std::string{
-        char h[NI_MAXHOST], s[NI_MAXSERV];
-        if(getnameinfo((const sockaddr*)&sa,(sa.ss_family==AF_INET?sizeof(sockaddr_in):sizeof(sockaddr_in6)),h,sizeof(h),s,sizeof(s),NI_NUMERICHOST|NI_NUMERICSERV)==0){
-            return std::string(h)+":"+s; }
-        return std::string("?"); };
-    #endif
-    DBG(cout<<"LISTEN "<<host<<":"<<port<<"\n");
-    struct TaskRec{ Task task; sockaddr_storage addr; socklen_t len; };
-    // Single map keyed by client address; task id unique per client lifecycle.
-    unordered_map<ClientKey,TaskRec,ClientHash> clients; clients.reserve(512);
-    unordered_map<uint32_t,ClientKey> idIndex; idIndex.reserve(512);
-    uint32_t nextId=1; size_t ok=0,fail=0;
-    while(g_run){
-        fd_set rf; FD_ZERO(&rf); FD_SET(sock,&rf); timeval tv{1,0}; int sel=select(sock+1,&rf,nullptr,nullptr,&tv); if(sel<0){ if(errno==EINTR) continue; perror("select"); break; }
-        if(sel==0) continue;
-        sockaddr_storage ca{}; socklen_t clen=sizeof(ca); unsigned char buf[128]; ssize_t n=recvfrom(sock,buf,sizeof(buf),0,(sockaddr*)&ca,&clen); if(n<0){ if(errno==EINTR) continue; perror("recvfrom"); continue; }
-    ClientKey key{ca,clen}; auto itClient=clients.find(key); DBG(debugPacket(ca,clen,n,itClient==clients.end()));
-        if(n==(ssize_t)sizeof(calcMessage)){
-            calcMessage cm{}; memcpy(&cm,buf,sizeof(cm)); uint16_t t=ntohs(cm.type); if(ntohs(cm.major_version)==1 && ntohs(cm.minor_version)==1 && (t==21||t==22)){
-                bool wantText = (t==21);
-                if(itClient==clients.end()){
-                    Task tk=makeTask(nextId++); tk.text=wantText; TaskRec rec{tk,ca,clen}; clients[key]=rec; idIndex[tk.id]=key;
-                    if(wantText){
-                        string line=to_string(tk.id)+" "+(tk.op==1?"add":tk.op==2?"sub":tk.op==3?"mul":"div")+" "+to_string(tk.v1)+" "+to_string(tk.v2)+"\n";
-                        sendto(sock,line.c_str(),line.size(),0,(sockaddr*)&ca,clen);
-                    } else {
-                        calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(tk.id); out.arith=htonl(tk.op); out.inValue1=htonl(tk.v1); out.inValue2=htonl(tk.v2);
-                        sendto(sock,&out,sizeof(out),0,(sockaddr*)&ca,clen);
-                    }
-                    DBG({ std::cout<<"TASK id="<<tk.id<<" op="<<tk.op<<" v1="<<tk.v1<<" v2="<<tk.v2<<(wantText?" TEXT":" BIN")<<" from="<<addrStr(ca)<<"\n"; });
-                } else if(!itClient->second.task.done) {
-                    // Duplicate handshake -> resend existing task (reliability under packet loss)
-                    Task &tk=itClient->second.task;
-                    if(tk.text){
-                        string line=to_string(tk.id)+" "+(tk.op==1?"add":tk.op==2?"sub":tk.op==3?"mul":"div")+" "+to_string(tk.v1)+" "+to_string(tk.v2)+"\n";
-                        sendto(sock,line.c_str(),line.size(),0,(sockaddr*)&ca,clen);
-                    } else {
-                        calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(tk.id); out.arith=htonl(tk.op); out.inValue1=htonl(tk.v1); out.inValue2=htonl(tk.v2);
-                        sendto(sock,&out,sizeof(out),0,(sockaddr*)&ca,clen);
-                    }
-                }
-                continue;
-            }
+};
+
+struct ClientState {
+    uint32_t task_id = 0;
+    int32_t expected = 0;
+    int32_t v1 = 0, v2 = 0;
+    uint32_t arith = 0;
+    time_t timestamp = 0;
+    bool waiting = false;
+    bool is_binary = false;
+};
+
+static int setup_socket_bind(const char *host, const char *port) {
+    struct addrinfo hints{}, *res = NULL, *rp;
+    // default to IPv4 unless host explicitly looks like IPv6
+    bool prefer_ipv6 = false;
+    if (strchr(host, ':') != NULL || strcmp(host, "::1") == 0 || strcmp(host, "ip6-localhost") == 0) prefer_ipv6 = true;
+    hints.ai_family = prefer_ipv6 ? AF_INET6 : AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_NUMERICHOST; // require numeric host; if fails, fall back
+
+    int s = getaddrinfo(host, port, &hints, &res);
+    if (s != 0) {
+        // try without AI_NUMERICHOST to allow names like 'localhost'
+        hints.ai_flags = 0;
+        s = getaddrinfo(host, port, &hints, &res);
+        if (s != 0) return -1;
+    }
+
+    int fd = -1;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        // Only bind to same family as requested (prevent binding both v4+v6)
+        if (prefer_ipv6 && rp->ai_family != AF_INET6) continue;
+        if (!prefer_ipv6 && rp->ai_family != AF_INET) continue;
+
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd == -1) continue;
+        // increase buffers to handle concurrent bursts
+        int buf = 4 * 1024 * 1024;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+
+        if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break; // success
         }
-        if(n>=(ssize_t)24 && n<=(ssize_t)sizeof(calcProtocol)){
-            calcProtocol cp{}; memcpy(&cp,buf,std::min<size_t>(n,sizeof(cp)));
-            if(ntohs(cp.major_version)==1 && ntohs(cp.minor_version)==1){
-                uint16_t t=ntohs(cp.type); uint32_t id=ntohl(cp.id);
-                if(t==2 && id>0){
-                    auto itIdx=idIndex.find(id);
-                    if(itIdx!=idIndex.end()){
-                        auto cit=clients.find(itIdx->second); if(cit!=clients.end()){
-                        Task &tk=cit->second.task;
-                        auto age = chrono::duration_cast<chrono::seconds>(Clock::now()-tk.created).count();
-                        bool expired = age>10; // spec: remove task if >10s
-                        if(!tk.done){
-                            bool okAns = (!expired) && ((int32_t)ntohl(cp.inResult)==eval(tk));
-                            tk.done=true; tk.ok=okAns;
-                            calcMessage m{}; m.type=htons(2); m.message=htonl(okAns?1:2); m.protocol=htons(17); m.major_version=htons(1); m.minor_version=htons(1);
-                            sendto(sock,&m,sizeof(m),0,(sockaddr*)&ca,clen);
-                            DBG(std::cout<<"ANS id="<<id<<" ok="<<okAns<<(expired?" EXPIRED":"")<<"\n");
-                            if(okAns) ++ok; else ++fail;
-                        }
-                        clients.erase(cit); idIndex.erase(itIdx);
-                        }
-                    } else {
-                        // Unknown or expired/removed id: explicit NOT OK rejection
-                        calcMessage m{}; m.type=htons(2); m.message=htonl(2); m.protocol=htons(17); m.major_version=htons(1); m.minor_version=htons(1);
-                        sendto(sock,&m,sizeof(m),0,(sockaddr*)&ca,clen);
-                        DBG(std::cout<<"ANS id="<<id<<" late-or-unknown NOTOK\n");
-                    }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+static int send_calcProtocol_udp(int sockfd, const struct sockaddr *to, socklen_t tolen, const calcProtocol &cp_host) {
+    calcProtocol cp_net{};
+    cp_net.type = htons(cp_host.type);
+    cp_net.major_version = htons(cp_host.major_version);
+    cp_net.minor_version = htons(cp_host.minor_version);
+    cp_net.id = htonl(cp_host.id);
+    cp_net.arith = htonl(cp_host.arith);
+    cp_net.inValue1 = htonl(cp_host.inValue1);
+    cp_net.inValue2 = htonl(cp_host.inValue2);
+    cp_net.inResult = htonl(cp_host.inResult);
+    ssize_t s = sendto(sockfd, &cp_net, sizeof(cp_net), 0, to, tolen);
+    return (s == (ssize_t)sizeof(cp_net)) ? 0 : -1;
+}
+
+static int send_calcMessage_udp(int sockfd, const struct sockaddr *to, socklen_t tolen, uint32_t message) {
+    calcMessage m{};
+    m.type = htons(2);
+    m.message = htonl(message);
+    m.protocol = htons(17);
+    m.major_version = htons(1);
+    m.minor_version = htons(1);
+    ssize_t s = sendto(sockfd, &m, sizeof(m), 0, to, tolen);
+    return (s == (ssize_t)sizeof(m)) ? 0 : -1;
+}
+
+static bool is_valid_binary_protocol(const calcProtocol &cp) {
+    if (cp.major_version != 1 || cp.minor_version != 1) return false;
+    if (cp.type == 0 && cp.id == 0 && cp.arith == 0 && cp.inValue1 == 0 && cp.inValue2 == 0 && cp.inResult == 0) return false;
+    return true;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s host:port\n", argv[0]);
+        return 1;
+    }
+
+    initCalcLib();
+    srand((unsigned)time(NULL));
+
+    char *input = argv[1];
+    char *sep = strchr(input, ':');
+    if (!sep) { fprintf(stderr, "Error: input must be host:port\n"); return 1; }
+    char host[256]; char port[64];
+    size_t hlen = sep - input;
+    if (hlen >= sizeof(host)) { fprintf(stderr, "hostname too long\n"); return 1; }
+    strncpy(host, input, hlen); host[hlen] = '\0';
+    strncpy(port, sep + 1, sizeof(port) - 1); port[sizeof(port)-1] = '\0';
+
+    int sockfd = setup_socket_bind(host, port);
+    if (sockfd < 0) { perror("setup_socket_bind"); return 1; }
+
+    // Minimal startup print (required by tester)
+    printf("UDP server on %s:%s\n", host, port);
+    fflush(stdout);
+
+    std::map<ClientKey, ClientState> clients;
+
+    while (1) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(sockfd, &rfds);
+        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 5000; // 5ms
+        int rv = select(sockfd + 1, &rfds, NULL, NULL, &tv);
+        time_t now = time(NULL);
+
+        // cleanup stale clients periodically
+        static int cleanup_counter = 0;
+        if (++cleanup_counter >= 1000) {
+            cleanup_counter = 0;
+            std::vector<ClientKey> to_del;
+            for (auto &p : clients) {
+                if (p.second.waiting && (now - p.second.timestamp) > 10) {
+                    to_del.push_back(p.first);
+                }
+            }
+            for (auto &k : to_del) clients.erase(k);
+        }
+
+        if (rv <= 0) continue;
+        if (!FD_ISSET(sockfd, &rfds)) continue;
+
+        char buf[1024];
+        struct sockaddr_storage cliaddr;
+        socklen_t clilen = sizeof(cliaddr);
+        ssize_t n = recvfrom(sockfd, buf, sizeof(buf), 0, (struct sockaddr*)&cliaddr, &clilen);
+        if (n <= 0) continue;
+
+        ClientKey key; memset(&key, 0, sizeof(key));
+        memcpy(&key.ss, &cliaddr, sizeof(cliaddr)); key.len = clilen;
+        auto it = clients.find(key);
+        bool client_exists = (it != clients.end());
+
+        // Try binary
+        if (n == (ssize_t)sizeof(calcProtocol)) {
+            calcProtocol cp_net; memcpy(&cp_net, buf, sizeof(cp_net));
+            calcProtocol cp_host;
+            cp_host.type = ntohs(cp_net.type);
+            cp_host.major_version = ntohs(cp_net.major_version);
+            cp_host.minor_version = ntohs(cp_net.minor_version);
+            cp_host.id = ntohl(cp_net.id);
+            cp_host.arith = ntohl(cp_net.arith);
+            cp_host.inValue1 = ntohl(cp_net.inValue1);
+            cp_host.inValue2 = ntohl(cp_net.inValue2);
+            cp_host.inResult = ntohl(cp_net.inResult);
+
+            if (!client_exists) {
+                if (!is_valid_binary_protocol(cp_host)) {
+                    // ignore invalid binary hello
                     continue;
                 }
-            }
-        }
-        // Text protocol handling
-        {
-            string msg((char*)buf,(size_t)n);
-            while(!msg.empty()&&(msg.back()=='\n'||msg.back()=='\r')) msg.pop_back();
-            if(msg=="TEXT UDP 1.1" || msg=="BINARY UDP 1.1"){
-                if(itClient==clients.end()){
-                    Task tk=makeTask(nextId++); tk.text=(msg=="TEXT UDP 1.1"); TaskRec rec{tk,ca,clen}; clients[key]=rec; idIndex[tk.id]=key;
-                    if(tk.text){
-                        string line=to_string(tk.id)+" "+(tk.op==1?"add":tk.op==2?"sub":tk.op==3?"mul":"div")+" "+to_string(tk.v1)+" "+to_string(tk.v2)+"\n";
-                        sendto(sock,line.c_str(),line.size(),0,(sockaddr*)&ca,clen);
-                    } else {
-                        calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(tk.id); out.arith=htonl(tk.op); out.inValue1=htonl(tk.v1); out.inValue2=htonl(tk.v2);
-                        sendto(sock,&out,sizeof(out),0,(sockaddr*)&ca,clen);
-                    }
-                    DBG({ std::cout<<"TASK id="<<tk.id<<(tk.text?" TEXT":" BIN")<<" from="<<addrStr(ca)<<"\n"; });
-                } else if(!itClient->second.task.done) {
-                    // Duplicate textual handshake: resend existing task for reliability
-                    Task &tk=itClient->second.task;
-                    if(tk.text){
-                        string line=to_string(tk.id)+" "+(tk.op==1?"add":tk.op==2?"sub":tk.op==3?"mul":"div")+" "+to_string(tk.v1)+" "+to_string(tk.v2)+"\n";
-                        sendto(sock,line.c_str(),line.size(),0,(sockaddr*)&ca,clen);
-                    } else {
-                        calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(tk.id); out.arith=htonl(tk.op); out.inValue1=htonl(tk.v1); out.inValue2=htonl(tk.v2);
-                        sendto(sock,&out,sizeof(out),0,(sockaddr*)&ca,clen);
-                    }
+                // New binary client: send task
+                ClientState cs{}; cs.is_binary = true; cs.waiting = true; cs.timestamp = now;
+                uint32_t code = (rand() % 4) + 1;
+                int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
+                int32_t expected = (code==1? a+b : code==2? a-b : code==3? a*b : a/b);
+                uint32_t id = (uint32_t)(rand() ^ time(NULL));
+                cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
+                clients[key] = cs;
+
+                calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1;
+                out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
+                send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                continue;
+            } else {
+                // Existing binary client: validate answer
+                ClientState &cs = it->second;
+                if (cp_host.id != cs.task_id) {
+                    send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                } else if ((now - cs.timestamp) > 10) {
+                    send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                } else {
+                    int32_t received_result = (int32_t)cp_host.inResult;
+                    if (received_result == cs.expected) send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 1);
+                    else send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
                 }
+                clients.erase(it);
                 continue;
             }
-            if(itClient!=clients.end()){
-                TaskRec &rec=itClient->second; Task &tk=rec.task; 
-                bool handled=false; 
-                size_t sp=msg.find(' ');
-                if(sp!=string::npos){
-                    bool pars=true; uint32_t rid=0; long long ans=0; try{ rid=stoul(msg.substr(0,sp)); ans=stoll(msg.substr(sp+1)); }catch(...){ pars=false; }
-                    if(pars && rid==tk.id && !tk.done){
-                        auto age=chrono::duration_cast<chrono::seconds>(Clock::now()-tk.created).count(); bool expired=age>10;
-                        bool okAns = (!expired) && (ans==eval(tk));
-                        tk.done=true; tk.ok=okAns; handled=true;
-                        string resp=(okAns?"OK ":"NOT OK ");
-                        sendto(sock,resp.c_str(),resp.size(),0,(sockaddr*)&ca,clen);
-                        DBG(std::cout<<"ANS id="<<tk.id<<" ok="<<okAns<<(expired?" EXPIRED":"")<<" from="<<addrStr(ca)<<"\n");
-                        if(okAns) ++ok; else ++fail;
-                        clients.erase(key); idIndex.erase(tk.id);
-                    }
-                }
-                if(!handled && !tk.done){
-                    // Try interpreting whole msg as just the answer (no id provided)
-                    bool pars=true; long long ans=0; try{ ans=stoll(msg); }catch(...){ pars=false; }
-                    if(pars){
-                        auto age=chrono::duration_cast<chrono::seconds>(Clock::now()-tk.created).count(); bool expired=age>10;
-                        bool okAns = (!expired) && (ans==eval(tk));
-                        tk.done=true; tk.ok=okAns; handled=true;
-                        string resp=(okAns?"OK ":"NOT OK ");
-                        sendto(sock,resp.c_str(),resp.size(),0,(sockaddr*)&ca,clen);
-                        DBG(std::cout<<"ANS id="<<tk.id<<" ok="<<okAns<<(expired?" EXPIRED":"")<<" from="<<addrStr(ca)<<"\n");
-                        if(okAns) ++ok; else ++fail; clients.erase(key); idIndex.erase(tk.id);
-                    }
-                }
-            }
-    }
+        }
 
-        // Periodic cleanup of expired tasks (no answer within 10s)
-        for(auto it=clients.begin(); it!=clients.end();){
-            Task &tk=it->second.task;
-            if(!tk.done){ auto age=chrono::duration_cast<chrono::seconds>(Clock::now()-tk.created).count(); if(age>10){ idIndex.erase(tk.id); it=clients.erase(it); continue; } }
-            ++it;
+        // If size matches calcMessage (binary) - handle 'hello' messages maybe ignored
+        if (n == (ssize_t)sizeof(calcMessage)) {
+            calcMessage m; memcpy(&m, buf, sizeof(m));
+            if (m.type == 0 && m.message == 0 && m.protocol == 0 && m.major_version == 0 && m.minor_version == 0) {
+                // ignore empty calcMessage
+                continue;
+            }
+            // fallthrough to text parsing in case it's actually text
+        }
+
+        // Text protocol handling
+        string s(buf, n);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+
+        if (!client_exists) {
+            // New text client: send task
+            ClientState cs{}; cs.is_binary = false; cs.waiting = true; cs.timestamp = now;
+            uint32_t code = (rand() % 4) + 1;
+            int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
+            int32_t expected = (code==1? a+b : code==2? a-b : code==3? a*b : a/b);
+            uint32_t id = (uint32_t)(rand() ^ time(NULL));
+            cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
+            clients[key] = cs;
+
+            const char *opstr = (code==1? "add" : code==2? "sub" : code==3? "mul" : "div");
+            char outmsg[128]; int len = snprintf(outmsg, sizeof(outmsg), "%u %s %d %d\n", id, opstr, a, b);
+            sendto(sockfd, outmsg, len, 0, (struct sockaddr*)&cliaddr, clilen);
+        } else {
+            // Existing text client: parse "id result"
+            ClientState &cs = it->second;
+            uint32_t id = 0; int32_t res = 0;
+            if (sscanf(s.c_str(), "%u %d", &id, &res) == 2) {
+                if (id != cs.task_id) {
+                    const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                } else if ((now - cs.timestamp) > 10) {
+                    const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                    clients.erase(it);
+                } else {
+                    if (res == cs.expected) {
+                        const char *ok = "OK\n"; sendto(sockfd, ok, strlen(ok), 0, (struct sockaddr*)&cliaddr, clilen);
+                    } else {
+                        const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                    }
+                    clients.erase(it);
+                }
+            } else {
+                const char *err = "ERROR PARSE\n"; sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+            }
         }
     }
-    close(sock);
+
+    close(sockfd);
     return 0;
 }
-
