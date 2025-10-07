@@ -89,7 +89,17 @@ int main(int argc, char* argv[]) {
                         calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(tk.id); out.arith=htonl(tk.op); out.inValue1=htonl(tk.v1); out.inValue2=htonl(tk.v2);
                         sendto(sock,&out,sizeof(out),0,(sockaddr*)&ca,clen);
                     }
-                    DBG(std::cout<<"TASK id="<<tk.id<<" op="<<tk.op<<" v1="<<tk.v1<<" v2="<<tk.v2<<(wantText?" TEXT":" BIN")<<" from="<<addrStr(ca)<<"\n");
+                    DBG({ std::cout<<"TASK id="<<tk.id<<" op="<<tk.op<<" v1="<<tk.v1<<" v2="<<tk.v2<<(wantText?" TEXT":" BIN")<<" from="<<addrStr(ca)<<"\n"; });
+                } else if(!itClient->second.task.done) {
+                    // Duplicate handshake -> resend existing task (reliability under packet loss)
+                    Task &tk=itClient->second.task;
+                    if(tk.text){
+                        string line=to_string(tk.id)+" "+(tk.op==1?"add":tk.op==2?"sub":tk.op==3?"mul":"div")+" "+to_string(tk.v1)+" "+to_string(tk.v2)+"\n";
+                        sendto(sock,line.c_str(),line.size(),0,(sockaddr*)&ca,clen);
+                    } else {
+                        calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(tk.id); out.arith=htonl(tk.op); out.inValue1=htonl(tk.v1); out.inValue2=htonl(tk.v2);
+                        sendto(sock,&out,sizeof(out),0,(sockaddr*)&ca,clen);
+                    }
                 }
                 continue;
             }
@@ -139,7 +149,17 @@ int main(int argc, char* argv[]) {
                         calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(tk.id); out.arith=htonl(tk.op); out.inValue1=htonl(tk.v1); out.inValue2=htonl(tk.v2);
                         sendto(sock,&out,sizeof(out),0,(sockaddr*)&ca,clen);
                     }
-                    DBG(std::cout<<"TASK id="<<tk.id<<(tk.text?" TEXT":" BIN")<<" from="<<addrStr(ca)<<"\n");
+                    DBG({ std::cout<<"TASK id="<<tk.id<<(tk.text?" TEXT":" BIN")<<" from="<<addrStr(ca)<<"\n"; });
+                } else if(!itClient->second.task.done) {
+                    // Duplicate textual handshake: resend existing task for reliability
+                    Task &tk=itClient->second.task;
+                    if(tk.text){
+                        string line=to_string(tk.id)+" "+(tk.op==1?"add":tk.op==2?"sub":tk.op==3?"mul":"div")+" "+to_string(tk.v1)+" "+to_string(tk.v2)+"\n";
+                        sendto(sock,line.c_str(),line.size(),0,(sockaddr*)&ca,clen);
+                    } else {
+                        calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1); out.id=htonl(tk.id); out.arith=htonl(tk.op); out.inValue1=htonl(tk.v1); out.inValue2=htonl(tk.v2);
+                        sendto(sock,&out,sizeof(out),0,(sockaddr*)&ca,clen);
+                    }
                 }
                 continue;
             }
