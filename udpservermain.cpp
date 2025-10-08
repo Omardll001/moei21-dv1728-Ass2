@@ -218,7 +218,7 @@ int main(int argc, char *argv[]) {
                 send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
                 continue;
             }
-            // else treat as text protocol
+            // else treat as text protocol ..
         }
 
         // Try binary (calcProtocol)
