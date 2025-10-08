@@ -20,6 +20,7 @@
 #include <vector>
 #include <unordered_map>
 #include <map>
+#include <algorithm>
 
 #include "protocol.h"
 extern "C" {
@@ -212,7 +213,7 @@ int main(int argc, char *argv[]) {
     struct iovec iovecs[BATCH_COUNT];
     static char bufs[BATCH_COUNT][1024];
     struct sockaddr_storage addrs[BATCH_COUNT];
-    socklen_t addrlens[BATCH_COUNT];
+    
     memset(msgs, 0, sizeof(msgs));
     for (int i = 0; i < BATCH_COUNT; ++i) {
         iovecs[i].iov_base = bufs[i];
@@ -345,8 +346,8 @@ int main(int argc, char *argv[]) {
                 }
 
                 // Text handling
-                string_view sv((char*)bufp, n);
-                while (!sv.empty() && (sv.back() == '\n' || sv.back() == '\r')) sv.remove_suffix(1);
+                std::string s((char*)bufp, n);
+                while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
 
                 if (!client_exists) {
                     ClientState cs{}; cs.is_binary = false; cs.waiting = true; cs.timestamp = now;
@@ -363,10 +364,7 @@ int main(int argc, char *argv[]) {
                 } else {
                     ClientState &cs = it->second;
                     uint32_t id = 0; int32_t res = 0;
-                    char tmp[64];
-                    int slen = (int)min((size_t)sizeof(tmp)-1, sv.size());
-                    memcpy(tmp, sv.data(), slen); tmp[slen] = 0;
-                    if (sscanf(tmp, "%u %d", &id, &res) == 2) {
+                    if (sscanf(s.c_str(), "%u %d", &id, &res) == 2) {
                         if (id != cs.task_id) {
                             const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
                         } else if ((now - cs.timestamp) > 10) {
