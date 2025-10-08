@@ -214,9 +214,8 @@ int main(int argc, char *argv[]) {
                 if (c < 9 || (c > 13 && c < 32) || c == 127) { printable = false; break; }
             }
             if (!printable) {
-                // Malformed binary/intermediate size -> reply with a text error for robustness.
-                const char *err = "ERROR PARSE\n";
-                sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+                // Malformed binary/intermediate size -> reply binary NOT-OK (calcMessage with message=2)
+                send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
                 continue;
             }
             // else treat as text protocol
