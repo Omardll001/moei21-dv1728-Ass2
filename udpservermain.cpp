@@ -1,416 +1,353 @@
-// Simplified, robust UDP server implementation for assignment.
-// Handles both TEXT UDP 1.1 and binary (calcProtocol / calcMessage) version 1.1.
-// Single socket (IPv4 or IPv6 depending on host argument) + select() loop, 10s task timeout.
+// udpservermain.cpp
+// Minimal UDP server for codegrade tests - updated to reply binary error messages for malformed binary input
 
-#include <iostream>
-#include <string>
-#include <unordered_map>
-#include <vector>
-#include <chrono>
-#include <cstring>
-#include <csignal>
-#include <algorithm>
-#include <cstdlib>
-#include <sstream>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <arpa/inet.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string>
+#include <time.h>
+#include <vector>
+#include <map>
+
 #include "protocol.h"
+extern "C" {
 #include "calcLib.h"
-
-using namespace std;
-using Clock = chrono::steady_clock;
-
-struct TaskInfo {
-    uint32_t id; uint32_t arith; int32_t v1; int32_t v2;
-    Clock::time_point ts;       // creation / issue time
-    Clock::time_point finished; // when answer accepted
-    bool isText=false;          // text protocol task
-    bool done=false;            // answer validated
-    bool lastOk=false;          // final correctness
-    Clock::time_point lastSend; // last time the task was (re)sent
-    int resendCount=0;          // proactive resend attempts
-    int sockfd=-1;              // socket used for this client's address
-    bool stuckLogged=false;     // whether we already logged STUCK
-    bool timeoutLogged=false;   // whether we already logged CLIENT_TIMEOUT
-};
-struct ClientKey { sockaddr_storage addr{}; socklen_t len{}; bool operator==(ClientKey const& o) const noexcept { if(len!=o.len) return false; if(addr.ss_family!=o.addr.ss_family) return false; if(addr.ss_family==AF_INET){auto *a=(sockaddr_in*)&addr;auto *b=(sockaddr_in*)&o.addr; return a->sin_port==b->sin_port && a->sin_addr.s_addr==b->sin_addr.s_addr;} else {auto *a=(sockaddr_in6*)&addr;auto *b=(sockaddr_in6*)&o.addr; return a->sin6_port==b->sin6_port && memcmp(&a->sin6_addr,&b->sin6_addr,sizeof(in6_addr))==0;} } };
-struct ClientHash { size_t operator()(ClientKey const& k) const noexcept { size_t h=0xcbf29ce484222325ULL; auto mix=[&](const void* d,size_t l){auto p=(const unsigned char*)d; for(size_t i=0;i<l;++i){h^=p[i]; h*=0x100000001b3ULL;}}; if(k.addr.ss_family==AF_INET){auto *a=(sockaddr_in*)&k.addr; mix(&a->sin_port,sizeof(a->sin_port)); mix(&a->sin_addr,sizeof(a->sin_addr));} else {auto *a=(sockaddr_in6*)&k.addr; mix(&a->sin6_port,sizeof(a->sin6_port)); mix(&a->sin6_addr,sizeof(a->sin6_addr));} return h; } };
-
-static volatile bool g_run=true; void handle_sig(int){ g_run=false; }
-
-static TaskInfo makeTask(uint32_t id){ TaskInfo t{}; t.id=id; int op=(randomInt()%4)+1; if(op==4){ do{ t.v2=randomInt()%100;}while(t.v2==0); t.v1=randomInt()%100; } else { t.v1=randomInt()%100; t.v2=randomInt()%100; } t.arith=op; t.ts=Clock::now(); return t; }
-static int32_t eval(const TaskInfo&t){ switch(t.arith){case 1: return t.v1+t.v2; case 2: return t.v1-t.v2; case 3: return t.v1*t.v2; case 4: return t.v1/t.v2;} return 0; }
-static const char* opname(uint32_t a){ switch(a){case 1:return "add"; case 2:return "sub"; case 3:return "mul"; case 4:return "div";} return "na"; }
-
-static bool splitAddress(const string &arg,string &host,string &port){ auto p=arg.rfind(':'); if(p==string::npos) return false; host=arg.substr(0,p); port=arg.substr(p+1); return !host.empty() && !port.empty(); }
-
-static string addrToString(const sockaddr_storage &ss){
-    char host[INET6_ADDRSTRLEN]="?"; uint16_t port=0; if(ss.ss_family==AF_INET){ auto *a=(sockaddr_in*)&ss; inet_ntop(AF_INET,&a->sin_addr,host,sizeof(host)); port=ntohs(a->sin_port);} else if(ss.ss_family==AF_INET6){ auto *a=(sockaddr_in6*)&ss; inet_ntop(AF_INET6,&a->sin6_addr,host,sizeof(host)); port=ntohs(a->sin6_port);} stringstream os; os<<host<<":"<<port; return os.str(); }
-
-int main(int argc,char*argv[]){
-    // DEBUG DEFAULT: Turned ON by default so CodeGrade run (which supplies only <host:port>) will emit EV/DIAG lines to server.log.
-    // To silence, pass --nodebug explicitly.
-    bool debug=true; // debug enables DIAG + high-level events
-    bool trace=true; // trace enables very chatty detailed events (waves etc.)
-    bool enableText=false; // text protocol disabled unless --text flag supplied
-    if(argc<2){ cerr<<"Usage: "<<argv[0]<<" <host:port> [--nodebug]"<<"\n"; return 1; }
-    // Parse optional flags (up to a few)
-    for(int i=2;i<argc;i++){
-        string flag=argv[i];
-        if(flag=="--nodebug") { debug=false; trace=false; }
-        else if(flag=="--debug") { debug=true; }
-        else if(flag=="--trace") { trace=true; debug=true; }
-        else if(flag=="--quiet") { debug=false; trace=false; }
-        else if(flag=="--text") { enableText=true; }
-        else if(flag.rfind("--loglevel=",0)==0){
-            string lvl=flag.substr(11);
-            if(lvl=="info"){ debug=true; trace=false; }
-            else if(lvl=="debug"){ debug=true; trace=false; }
-            else if(lvl=="trace"){ debug=true; trace=true; }
-            else if(lvl=="quiet"){ debug=false; trace=false; }
-        }
-    }
-    // Environment variable can still force on (harmless if already true)
-    if(!debug){ const char *e=getenv("UDPSRV_DEBUG"); if(e && *e) debug=true; }
-    signal(SIGINT,handle_sig); initCalcLib();
-    string host,port; if(!splitAddress(argv[1],host,port)){ cerr<<"Bad address format\n"; return 1; }
-    bool specialLocalHost = (host=="localhost");
-    if(host=="ip4-localhost") host="127.0.0.1"; else if(host=="ip6-localhost") host="::1";
-    vector<int> socks;
-    auto doBind=[&](const string &bindHost){
-        struct addrinfo hints{}; hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_DGRAM; hints.ai_flags=AI_PASSIVE; struct addrinfo *res=nullptr; 
-        if(getaddrinfo(bindHost.c_str(),port.c_str(),&hints,&res)!=0) return; 
-        for(auto *p=res;p;p=p->ai_next){
-            int s = socket(p->ai_family,p->ai_socktype,p->ai_protocol); if(s<0) continue; int yes=1; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
-            // Try dual-stack when IPv6 (set V6ONLY=0) so it can also accept v4-mapped
-            if(p->ai_family==AF_INET6){ int off=0; setsockopt(s,IPPROTO_IPV6,IPV6_V6ONLY,&off,sizeof(off)); }
-            if(bind(s,p->ai_addr,p->ai_addrlen)==0){ socks.push_back(s);} else { close(s);} }
-        freeaddrinfo(res);
-    };
-    if(specialLocalHost){
-        doBind("127.0.0.1");
-        doBind("::1");
-    } else {
-        doBind(host);
-    }
-    // Fallback: if 'localhost' given but nothing worked, try generic resolution once
-    if(socks.empty() && specialLocalHost){ doBind("localhost"); }
-    if(socks.empty()){ cerr<<"bind failed\n"; return 1; }
-    cout<<"udpserver running on "<<host<<":"<<port<<" sockets="<<socks.size(); if(debug){ cout<<" DEBUG=on"; if(trace) cout<<" TRACE=on"; } cout<<"\n"; cout.flush();
-    unordered_map<ClientKey,TaskInfo,ClientHash> tasks; uint32_t nextId=1;
-    unordered_map<uint32_t,ClientKey> idToClient; // id -> client key for port-move recovery
-    const auto serverStart = Clock::now();
-    int targetComplete = 100; if(const char *tc=getenv("TARGET_COMPLETE")){ int v=atoi(tc); if(v>0) targetComplete=v; }
-    // Diagnostics counters (debug only)
-    size_t pkt_recv=0, pkt_binary=0, pkt_text=0, tasks_issued=0, answers_ok=0, answers_fail=0, resend_task=0, reack=0;
-    auto lastDiag = Clock::now();
-    auto lastDiagForced = Clock::now();
-    // Snapshot of last printed counters to suppress duplicates
-    size_t last_pkt_recv=SIZE_MAX, last_pkt_binary=SIZE_MAX, last_pkt_text=SIZE_MAX, last_tasks_issued=SIZE_MAX,
-        last_answers_ok=SIZE_MAX, last_answers_fail=SIZE_MAX, last_resend_task=SIZE_MAX, last_reack=SIZE_MAX, last_outstanding=SIZE_MAX;
-    while(g_run){
-        fd_set rfds; FD_ZERO(&rfds); int maxfd=0; for(int s: socks){ FD_SET(s,&rfds); if(s>maxfd) maxfd=s; }
-        // Reduced latency: 10ms select timeout
-        timeval tv{0,10000}; int sel=select(maxfd+1,&rfds,nullptr,nullptr,&tv); if(sel<0){ if(errno==EINTR) continue; perror("select"); break; }
-        auto now=Clock::now();
-        // Cleanup: remove tasks older than 10s if not done; if done keep for 2s for possible re-ACK needs
-        for(auto it=tasks.begin(); it!=tasks.end();){
-            auto age = chrono::duration_cast<chrono::seconds>(now - it->second.ts).count();
-            if(!it->second.done) {
-                if(age>10) { it = tasks.erase(it); continue; }
-            } else {
-                auto doneAge = chrono::duration_cast<chrono::milliseconds>(now - it->second.finished).count();
-                if(doneAge > 2000) { idToClient.erase(it->second.id); it = tasks.erase(it); continue; }
-            }
-            ++it;
-        }
-        // Even if sel==0 (no new packets), we still want to run proactive resend & diagnostics below.
-        if(sel>0){
-        for(int s: socks){
-            if(!FD_ISSET(s,&rfds)) continue;
-            for(int drain=0; drain<1024; ++drain){
-                sockaddr_storage caddr{}; socklen_t clen=sizeof(caddr); unsigned char buf[256];
-                ssize_t n=recvfrom(s,buf,sizeof(buf),MSG_DONTWAIT,(sockaddr*)&caddr,&clen);
-                if(n<0){
-                    if(errno==EAGAIN||errno==EWOULDBLOCK) break; else { perror("recvfrom"); break; }
-                }
-                if(n<0) break;
-                ++pkt_recv;
-                ClientKey key; key.addr=caddr; key.len=clen;
-                // Fast drop malformed sizes (not calcMessage=12, not calcProtocol=sizeof(calcProtocol), and text not enabled)
-                if(!enableText && (size_t)n!=sizeof(calcMessage) && (size_t)n!=sizeof(calcProtocol)){
-                    if(n==13){
-                        if(trace) cout<<"EV TRUNC13 treat-as-handshake addr="<<addrToString(caddr)<<"\n";
-                        // fallthrough: first 12 bytes used below
-                    } else { if(trace) cout<<"EV DROP size="<<n<<" addr="<<addrToString(caddr)<<"\n"; continue; }
-                }
-                if(enableText){
-                    // If enabled text, still drop obviously invalid tiny/huge packets (1..3 or >128) to avoid wasting cycles
-                    if((size_t)n!=sizeof(calcMessage) && (size_t)n!=sizeof(calcProtocol)){
-                        if(n<5 || n>200){ if(trace) cout<<"EV DROP size(text-mode)="<<n<<" addr="<<addrToString(caddr)<<"\n"; continue; }
-                    }
-                }
-                // (Optional) calcMessage handshake: treat as 'new request' when no task or re-ACK when done
-                if((size_t)n == sizeof(calcMessage) || n==13) {
-                    calcMessage cm{}; memcpy(&cm,buf,sizeof(cm));
-                    uint16_t maj=ntohs(cm.major_version), min=ntohs(cm.minor_version);
-                    uint16_t ctype=ntohs(cm.type);
-                    if(maj==1 && min==1 && (ctype==21||ctype==22)){
-                        auto itT=tasks.find(key);
-                        if(itT==tasks.end()){
-                            // Capacity guard: avoid unbounded growth if clients churn ports
-                            size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
-                            if(activePending>=500) { if(trace) cout<<"EV DROP newtask-cap bin(handshake) addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; continue; }
-                            TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t; idToClient[t.id]=key;
-                            if(debug) cout<<"EV NEWTASK bin(handshake) id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
-                            calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
-                            out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
-                            if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-handshake"); else ++tasks_issued;
-                        } else if(itT->second.done){
-                            // Instead of only re-ACK, give a new task so client can progress
-                            size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
-                            if(activePending>=500) {
-                                if(trace) cout<<"EV DROP newtask-cap bin(handshake-after-done) addr="<<addrToString(caddr)<<" active="<<activePending<<"\n";
-                                // still send re-ack so client knows status
-                                calcMessage msg{}; msg.type=htons(2); msg.message=htonl(itT->second.lastOk?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
-                                sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen);
-                            } else {
-                                TaskInfo nt=makeTask(nextId++); nt.isText=false; nt.lastSend=Clock::now(); nt.sockfd=s; tasks[key]=nt; idToClient[nt.id]=key;
-                                if(debug) cout<<"EV NEWTASK bin(handshake-after-done) id="<<nt.id<<" prev="<<itT->second.id<<" ok="<<itT->second.lastOk<<" addr="<<addrToString(caddr)<<"\n";
-                                calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
-                                out.id=htonl(nt.id); out.arith=htonl(nt.arith); out.inValue1=htonl(nt.v1); out.inValue2=htonl(nt.v2); out.inResult=0;
-                                if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-handshake-newtask"); else ++tasks_issued;
-                            }
-                        } else {
-                            if(trace) cout<<"EV RESEND bin(handshake) id="<<itT->second.id<<" addr="<<addrToString(caddr)<<"\n";
-                            // resend ongoing task
-                            TaskInfo &t=itT->second; t.sockfd=s;
-                            calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
-                            out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
-                            if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-rehandshake"); else ++resend_task;
-                        }
-                        continue;
-                    }
-                }
-                // Accept calcProtocol answers with slight size variations (padding differences) 24..32 bytes.
-                if( (size_t)n == sizeof(calcProtocol) || (n >= 24 && n <= 32) ) {
-                    if((size_t)n != sizeof(calcProtocol) && trace){
-                        cout<<"EV CPVAR size="<<n<<" expect="<<sizeof(calcProtocol)<<" addr="<<addrToString(caddr)<<" (treat-as calcProtocol)\n";
-                    }
-                    ++pkt_binary; calcProtocol cp{}; // zero-init then copy min(n, sizeof(cp))
-                    size_t copyLen = std::min<size_t>(n, sizeof(cp));
-                    memcpy(&cp,buf,copyLen);
-                    uint16_t /*type*/ maj=ntohs(cp.major_version); uint16_t min=ntohs(cp.minor_version);
-                // Accept both legacy (1/2) and assignment provided (21/22) client type codes
-                if(!(maj==1 && min==1)) continue;
-                auto it=tasks.find(key);
-                uint32_t idNet=ntohl(cp.id);
-                int32_t inRes=ntohl(cp.inResult);
-                if(it==tasks.end()){
-                    // Attempt port-move recovery using id mapping (only if non-zero id)
-                    if(idNet!=0){
-                        auto f = idToClient.find(idNet);
-                        if(f!=idToClient.end()){
-                            auto itOld = tasks.find(f->second);
-                            if(itOld!=tasks.end()){
-                                // Verify same host (IP) but different port
-                                bool sameHost=true; bool portChanged=false;
-                                if(f->second.addr.ss_family!=key.addr.ss_family) sameHost=false; else if(key.addr.ss_family==AF_INET){
-                                    auto *a=(sockaddr_in*)&f->second.addr; auto *b=(sockaddr_in*)&key.addr; sameHost = (a->sin_addr.s_addr==b->sin_addr.s_addr); portChanged = (a->sin_port!=b->sin_port);
-                                } else {
-                                    auto *a=(sockaddr_in6*)&f->second.addr; auto *b=(sockaddr_in6*)&key.addr; sameHost = memcmp(&a->sin6_addr,&b->sin6_addr,sizeof(in6_addr))==0; portChanged = (a->sin6_port!=b->sin6_port);
-                                }
-                                if(sameHost){
-                                    TaskInfo moved = itOld->second; tasks.erase(itOld); tasks[key]=moved; idToClient[moved.id]=key; it=tasks.find(key);
-                                    if(trace) cout<<"EV PORTMOVE id="<<moved.id<<" new="<<addrToString(key.addr)<<" portChanged="<<portChanged<<"\n";
-                                }
-                            }
-                        }
-                    }
-                }
-                if(it==tasks.end()){
-                    if(idNet==0){
-                        size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
-                        if(activePending>=500) { if(trace) cout<<"EV DROP newtask-cap bin addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
-                        else { TaskInfo t=makeTask(nextId++); t.isText=false; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t; idToClient[t.id]=key;
-                        if(debug) cout<<"EV NEWTASK bin id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
-                        calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
-                        out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
-                        if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-task"); else ++tasks_issued; }
-                    } else {
-                        // ignore unexpected first packet with non-zero id
-                    }
-                } else {
-                    TaskInfo &t = it->second; t.sockfd=s;
-                    if(!t.done){
-                        if(idNet==0){
-                            // resend task
-                            if(trace) cout<<"EV RESEND bin id="<<t.id<<" addr="<<addrToString(caddr)<<"\n";
-                            calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
-                            out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
-                            if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-resend"); else ++resend_task;
-                            t.lastSend=Clock::now();
-                        } else if(idNet==t.id){
-                            // answer processing
-                            auto age=chrono::duration_cast<chrono::seconds>(now - t.ts).count();
-                            int32_t real=eval(t);
-                            if(trace) cout<<"EV PROCESS_ANSWER id="<<t.id<<" inRes="<<inRes<<" expect="<<real<<" age="<<age<<" resendCount="<<t.resendCount<<"\n";
-                            calcMessage msg{}; msg.type=htons(2); bool ok=(age<=10)&&(inRes==real);
-                            msg.message=htonl(ok?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
-                            if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-answer");
-                            if(debug) cout<<"EV ANSWER bin id="<<t.id<<" ok="<<ok<<" expect="<<real<<" got="<<inRes<<" age="<<age<<" addr="<<addrToString(caddr)<<"\n";
-                            if(ok) ++answers_ok; else ++answers_fail; t.done=true; t.finished=Clock::now(); t.lastOk=ok;
-                            if((answers_ok+answers_fail)%10==0){ auto ms=chrono::duration_cast<chrono::milliseconds>(Clock::now()-serverStart).count(); if(debug) cout<<"EV PROGRESS totalAns="<<(answers_ok+answers_fail)<<" ok="<<answers_ok<<" fail="<<answers_fail<<" elapsedMs="<<ms<<"\n"; }
-                            if(answers_ok>=targetComplete){ auto ms=chrono::duration_cast<chrono::milliseconds>(Clock::now()-serverStart).count(); cout<<"EV COMPLETE ok="<<answers_ok<<" fail="<<answers_fail<<" elapsedMs="<<ms<<"\n"; }
-                        } else {
-                            if(trace) cout<<"EV STRAY bin curId="<<t.id<<" gotId="<<idNet<<" addr="<<addrToString(caddr)<<"\n";
-                            // stray answer ignored
-                        }
-                    } else {
-                        if(idNet==0){
-                            // new task request after completion
-                            TaskInfo nt=makeTask(nextId++); nt.isText=false; nt.lastSend=Clock::now(); nt.sockfd=s; tasks[key]=nt; idToClient[nt.id]=key;
-                            if(debug) cout<<"EV NEWTASK bin(after-done) id="<<nt.id<<" prev="<<t.id<<" ok="<<t.lastOk<<" addr="<<addrToString(caddr)<<"\n";
-                            calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
-                            out.id=htonl(nt.id); out.arith=htonl(nt.arith); out.inValue1=htonl(nt.v1); out.inValue2=htonl(nt.v2); out.inResult=0;
-                            if(sendto(s,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-newtask"); else ++tasks_issued;
-                        } else if(idNet==t.id){
-                            // duplicate answer re-ACK
-                            calcMessage msg{}; msg.type=htons(2); msg.message=htonl(t.lastOk?1:2); msg.protocol=htons(17); msg.major_version=htons(1); msg.minor_version=htons(1);
-                            if(sendto(s,&msg,sizeof(msg),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(msg)) perror("sendto-reack"); else ++reack;
-                            if(trace) cout<<"EV REACK bin duplicate id="<<t.id<<" ok="<<t.lastOk<<" addr="<<addrToString(caddr)<<"\n";
-                        } else {
-                            if(trace) cout<<"EV STRAY bin-done prevId="<<t.id<<" gotId="<<idNet<<" addr="<<addrToString(caddr)<<"\n";
-                            // ignore
-                        }
-                    }
-                }
-                } else if(enableText) { // treat as TEXT only if enabled
-                    ++pkt_text;
-                    string txt((char*)buf,(size_t)n);
-                    txt.erase(remove(txt.begin(),txt.end(),'\r'),txt.end());
-                    txt.erase(remove(txt.begin(),txt.end(),'\n'),txt.end());
-                    auto it=tasks.find(key);
-                    if(txt=="TEXT UDP 1.1"){
-                        if(it==tasks.end() || it->second.done){
-                            size_t activePending=0; for(auto &kv:tasks) if(!kv.second.done) ++activePending;
-                            if(activePending>=500) { if(trace) cout<<"EV DROP newtask-cap text addr="<<addrToString(caddr)<<" active="<<activePending<<"\n"; }
-                            else { TaskInfo t=makeTask(nextId++); t.isText=true; t.lastSend=Clock::now(); t.sockfd=s; tasks[key]=t; idToClient[t.id]=key;
-                            if(debug) cout<<"EV NEWTASK text id="<<t.id<<" addr="<<addrToString(caddr)<<" op="<<opname(t.arith)<<" v1="<<t.v1<<" v2="<<t.v2<<"\n";
-                            string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
-                            if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-task"); else ++tasks_issued; }
-                        } else if(it->second.isText){
-                            TaskInfo &t=it->second; t.sockfd=s; string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
-                            if(trace) cout<<"EV RESEND text id="<<t.id<<" addr="<<addrToString(caddr)<<"\n";
-                            if(sendto(s,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-resend"); else ++resend_task;
-                            t.lastSend=Clock::now();
-                        } else {
-                            // binary task active, ignore text request
-                        }
-                    } else if(it!=tasks.end() && it->second.isText){
-                        size_t sp=txt.find(' ');
-                        if(sp!=string::npos){
-                            bool parsed=true; uint32_t rid=0; long long ans=0;
-                            try{ rid=stoul(txt.substr(0,sp)); ans=stoll(txt.substr(sp+1)); }catch(...){ parsed=false; }
-                            if(parsed && rid==it->second.id){
-                                auto age=chrono::duration_cast<chrono::seconds>(now - it->second.ts).count();
-                                long long real=eval(it->second); bool ok=(age<=10)&&(ans==real);
-                                string resp=(ok?"OK ":"NOT OK ");
-                                if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-answer");
-                                if(debug) cout<<"EV ANSWER text id="<<it->second.id<<" ok="<<ok<<" expect="<<real<<" got="<<ans<<" addr="<<addrToString(caddr)<<"\n";
-                                if(ok) ++answers_ok; else ++answers_fail; it->second.done=true; it->second.finished=Clock::now(); it->second.lastOk=ok;
-                                if((answers_ok+answers_fail)%10==0){ auto ms=chrono::duration_cast<chrono::milliseconds>(Clock::now()-serverStart).count(); if(debug) cout<<"EV PROGRESS totalAns="<<(answers_ok+answers_fail)<<" ok="<<answers_ok<<" fail="<<answers_fail<<" elapsedMs="<<ms<<"\n"; }
-                                if(answers_ok>=targetComplete){ auto ms=chrono::duration_cast<chrono::milliseconds>(Clock::now()-serverStart).count(); cout<<"EV COMPLETE ok="<<answers_ok<<" fail="<<answers_fail<<" elapsedMs="<<ms<<"\n"; }
-                            } else if(parsed){
-                                string resp=string("NOT OK ");
-                                if(sendto(s,resp.c_str(),resp.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-text-reject");
-                                if(trace) cout<<"EV ANSWER text WRONG rid="<<rid<<" cur="<<it->second.id<<" addr="<<addrToString(caddr)<<"\n";
-                                ++answers_fail; it->second.done=true; it->second.finished=Clock::now(); it->second.lastOk=false;
-                            }
-                        }
-                    }
-                }
-            }
-        } // end socks loop
-        } // end if(sel>0)
-        // Proactive resend: aggregated logging. We batch tasks that need resend this wave.
-        static unsigned long resendWave=0; // monotonically increasing wave counter
-        vector<int> waveIds; waveIds.reserve(64);
-        auto nowPR = Clock::now();
-        for(auto &kv : tasks){
-            TaskInfo &t = kv.second; if(t.done) continue; auto msSince=chrono::duration_cast<chrono::milliseconds>(nowPR - t.lastSend).count();
-            auto ageS = chrono::duration_cast<chrono::seconds>(nowPR - t.ts).count();
-            if(ageS>=10) continue; // nearing cleanup
-            // Adaptive resend schedule: faster early retries, then slow.
-            static const int schedule[] = {120,200,300,400,500,650,800,1000,1200,1500};
-            int idx = t.resendCount; if(idx<0) idx=0; if(idx >= (int)(sizeof(schedule)/sizeof(schedule[0]))) idx = (int)(sizeof(schedule)/sizeof(schedule[0]))-1;
-            int base = schedule[idx];
-            int jitter = ((int)t.id * 97 + t.resendCount * 79) % 60; // 0..59ms jitter
-            int targetMs = base + jitter;
-            // If appears stuck (few resends but large age), shorten delay
-            if(t.resendCount<2 && ageS>=2) targetMs = min(targetMs, 250);
-            // Force resend if we somehow exceeded 2x planned (safety)
-            if(msSince >= targetMs || msSince >= 2*targetMs){
-                int useSock = (t.sockfd>=0)? t.sockfd : (socks.empty()? -1 : socks[0]);
-                if(useSock<0) continue;
-                const sockaddr_storage &caddr = kv.first.addr; socklen_t clen = kv.first.len;
-                if(t.isText){
-                    string line=to_string(t.id)+" "+opname(t.arith)+" "+to_string(t.v1)+" "+to_string(t.v2)+"\n";
-                    if(sendto(useSock,line.c_str(),line.size(),0,(sockaddr*)&caddr,clen)<0) perror("sendto-proactive-text"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; waveIds.push_back(t.id); if(trace) cout<<"EV ADAPT_RESEND text id="<<t.id<<" delayMs="<<msSince<<" sched="<<targetMs<<" rc="<<t.resendCount<<"\n"; }
-                } else {
-                    calcProtocol out{}; out.type=htons(1); out.major_version=htons(1); out.minor_version=htons(1);
-                    out.id=htonl(t.id); out.arith=htonl(t.arith); out.inValue1=htonl(t.v1); out.inValue2=htonl(t.v2); out.inResult=0;
-                    if(sendto(useSock,&out,sizeof(out),0,(sockaddr*)&caddr,clen)!=(ssize_t)sizeof(out)) perror("sendto-proactive-bin"); else { t.lastSend=nowPR; ++t.resendCount; ++resend_task; waveIds.push_back(t.id); if(trace) cout<<"EV ADAPT_RESEND bin id="<<t.id<<" delayMs="<<msSince<<" sched="<<targetMs<<" rc="<<t.resendCount<<"\n"; }
-                }
-            }
-        }
-        if(trace && !waveIds.empty()){
-            ++resendWave;
-            // Show at most first 16 ids, plus counts summary. Provide min/max resendCount among them.
-            int shown = min<size_t>(waveIds.size(),16);
-            int minR=INT32_MAX, maxR=0; for(auto &kv:tasks){ if(!kv.second.done) { minR=min(minR,kv.second.resendCount); maxR=max(maxR,kv.second.resendCount);} }
-            cout<<"EV PROACTIVE_RESEND_WAVE num="<<waveIds.size()<<" wave="<<resendWave<<" ids=";
-            for(int i=0;i<shown;++i){ if(i) cout<<","; cout<<waveIds[i]; }
-            if((int)waveIds.size()>shown) cout<<"...";
-            cout<<" resendRange="<<minR<<"-"<<maxR<<"\n";
-        }
-        // STUCK / TIMEOUT diagnostics (lightweight, only once per task per level)
-        for(auto &kv: tasks){
-            TaskInfo &t = kv.second; if(t.done) continue; auto ageS=chrono::duration_cast<chrono::seconds>(Clock::now() - t.ts).count();
-            if(!t.stuckLogged && ageS>=3 && t.resendCount>=4){ if(trace) cout<<"EV STUCK id="<<t.id<<" age="<<ageS<<"s resend="<<t.resendCount<<"\n"; t.stuckLogged=true; }
-            if(!t.timeoutLogged && ageS>=6 && t.resendCount>=8){ if(debug) cout<<"EV CLIENT_TIMEOUT id="<<t.id<<" age="<<ageS<<"s resend="<<t.resendCount<<"\n"; t.timeoutLogged=true; }
-        }
-        auto now2 = Clock::now();
-        // Compute pending (not done) tasks for more meaningful 'outstanding'
-        size_t pendingCount=0; for(auto &kv:tasks) if(!kv.second.done) ++pendingCount;
-        bool countersChanged = pkt_recv!=last_pkt_recv || pkt_binary!=last_pkt_binary || pkt_text!=last_pkt_text ||
-                               tasks_issued!=last_tasks_issued || answers_ok!=last_answers_ok || answers_fail!=last_answers_fail ||
-                               resend_task!=last_resend_task || reack!=last_reack || pendingCount!=last_outstanding;
-        bool timeForForced = chrono::duration_cast<chrono::seconds>(now2 - lastDiagForced).count()>=2; // force every 2s
-        if(countersChanged || chrono::duration_cast<chrono::seconds>(now2 - lastDiag).count()>=1 || timeForForced){
-            if(debug){
-                cout << "DIAG pkts="<<pkt_recv<<" bin="<<pkt_binary<<" txt="<<pkt_text<<" tasks="<<tasks_issued<<" resend="<<resend_task<<" ok="<<answers_ok<<" fail="<<answers_fail<<" reack="<<reack<<" outstanding="<<pendingCount<<"\n";
-                if(pendingCount>0){
-                    int shown=0; cout<<"PEND ";
-                    for(auto &kv:tasks){ if(shown>=12) break; const TaskInfo &t=kv.second; if(t.done) continue; auto ageS=chrono::duration_cast<chrono::milliseconds>(now2 - t.ts).count()/1000.0; cout<<t.id<<"("<<ageS<<"s,r="<<t.resendCount<<") "; ++shown; }
-                    cout<<"\n";
-                }
-            } else {
-                cout << "DIAG pkts="<<pkt_recv<<" tasks="<<tasks_issued<<" ok="<<answers_ok<<" fail="<<answers_fail<<" out="<<pendingCount<<"\n";
-            }
-            last_pkt_recv=pkt_recv; last_pkt_binary=pkt_binary; last_pkt_text=pkt_text; last_tasks_issued=tasks_issued;
-            last_answers_ok=answers_ok; last_answers_fail=answers_fail; last_resend_task=resend_task; last_reack=reack; last_outstanding=pendingCount;
-            lastDiag=now2; if(timeForForced) lastDiagForced=now2;
-        }
-    }
-    for(int s: socks) {
-        close(s);
-    }
-    return 0;
 }
 
+using namespace std;
 
+// Fixed wire sizes used by the tests (do not rely on struct packing)
+static const size_t CP_SIZE = 26; // calcProtocol on the wire
+static const size_t CM_SIZE = 12; // calcMessage on the wire
 
+static inline uint16_t read_u16_be(const unsigned char *buf) { uint16_t v; memcpy(&v, buf, sizeof(v)); return ntohs(v); }
+static inline uint32_t read_u32_be(const unsigned char *buf) { uint32_t v; memcpy(&v, buf, sizeof(v)); return ntohl(v); }
+static inline void write_u16_be(unsigned char *buf, uint16_t v) { uint16_t t = htons(v); memcpy(buf, &t, sizeof(t)); }
+static inline void write_u32_be(unsigned char *buf, uint32_t v) { uint32_t t = htonl(v); memcpy(buf, &t, sizeof(t)); }
+
+struct ClientKey {
+    struct sockaddr_storage ss;
+    socklen_t len;
+    bool operator<(const ClientKey& o) const {
+        if (ss.ss_family != o.ss.ss_family) return ss.ss_family < o.ss.ss_family;
+        if (ss.ss_family == AF_INET) {
+            const auto a = (const struct sockaddr_in*)&ss;
+            const auto b = (const struct sockaddr_in*)&o.ss;
+            uint16_t pa = ntohs(a->sin_port);
+            uint16_t pb = ntohs(b->sin_port);
+            if (pa != pb) return pa < pb;
+            uint32_t ia = ntohl(a->sin_addr.s_addr);
+            uint32_t ib = ntohl(b->sin_addr.s_addr);
+            return ia < ib;
+        } else if (ss.ss_family == AF_INET6) {
+            const auto a = (const struct sockaddr_in6*)&ss;
+            const auto b = (const struct sockaddr_in6*)&o.ss;
+            int cmp = memcmp(&a->sin6_addr, &b->sin6_addr, sizeof(a->sin6_addr));
+            if (cmp != 0) return cmp < 0;
+            uint16_t pa = ntohs(a->sin6_port);
+            uint16_t pb = ntohs(b->sin6_port);
+            return pa < pb;
+        }
+        return false;
+    }
+};
+
+struct ClientState {
+    uint32_t task_id = 0;
+    int32_t expected = 0;
+    int32_t v1 = 0, v2 = 0;
+    uint32_t arith = 0;
+    time_t timestamp = 0;
+    bool waiting = false;
+    bool is_binary = false;
+};
+
+static int setup_socket_bind(const char *host_in, const char *port) {
+    const char *host = host_in;
+    bool prefer_ipv6 = false;
+    if (strcmp(host_in, "ip4-localhost") == 0) host = "127.0.0.1";
+    else if (strcmp(host_in, "ip6-localhost") == 0) { host = "::1"; prefer_ipv6 = true; }
+
+    struct addrinfo hints{}, *res = NULL, *rp;
+    hints.ai_family = prefer_ipv6 ? AF_INET6 : AF_INET; // only one family
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = 0;
+
+    int s = getaddrinfo(host, port, &hints, &res);
+    if (s != 0) {
+        return -1;
+    }
+
+    int fd = -1;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        if (rp->ai_family != hints.ai_family) continue; // only bind to requested family
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd == -1) continue;
+        int buf = 4 * 1024 * 1024;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+        if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            freeaddrinfo(res);
+            return fd; // success
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return -1;
+}
+
+static int send_calcProtocol_udp(int sockfd, const struct sockaddr *to, socklen_t tolen, const calcProtocol &cp_host) {
+    unsigned char buf[CP_SIZE];
+    // layout: type(2), major(2), minor(2), id(4), arith(4), inValue1(4), inValue2(4), inResult(4)
+    write_u16_be(buf + 0, cp_host.type);
+    write_u16_be(buf + 2, cp_host.major_version);
+    write_u16_be(buf + 4, cp_host.minor_version);
+    write_u32_be(buf + 6, cp_host.id);
+    write_u32_be(buf +10, cp_host.arith);
+    write_u32_be(buf +14, cp_host.inValue1);
+    write_u32_be(buf +18, cp_host.inValue2);
+    write_u32_be(buf +22, cp_host.inResult);
+    ssize_t s = sendto(sockfd, buf, CP_SIZE, 0, to, tolen);
+    return (s == (ssize_t)CP_SIZE) ? 0 : -1;
+}
+
+static int send_calcMessage_udp(int sockfd, const struct sockaddr *to, socklen_t tolen, uint32_t message) {
+    unsigned char buf[CM_SIZE];
+    // layout: type(2), message(4), protocol(2), major(2), minor(2)
+    write_u16_be(buf + 0, 2);
+    write_u32_be(buf + 2, message);
+    write_u16_be(buf + 6, 17);
+    write_u16_be(buf + 8, 1);
+    write_u16_be(buf +10, 1);
+    ssize_t s = sendto(sockfd, buf, CM_SIZE, 0, to, tolen);
+    return (s == (ssize_t)CM_SIZE) ? 0 : -1;
+}
+
+static bool is_valid_binary_protocol(const calcProtocol &cp) {
+    if (cp.major_version != 1 || cp.minor_version != 1) return false;
+    if (cp.type == 0 && cp.id == 0 && cp.arith == 0 && cp.inValue1 == 0 && cp.inValue2 == 0 && cp.inResult == 0) return false;
+    return true;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) { fprintf(stderr, "Usage: %s host:port\n", argv[0]); return 1; }
+    initCalcLib();
+    srand((unsigned)time(NULL));
+
+    char *input = argv[1];
+    char *sep = strchr(input, ':');
+    if (!sep) { fprintf(stderr, "Error: input must be host:port\n"); return 1; }
+    char host[256]; char port[64];
+    size_t hlen = sep - input;
+    if (hlen >= sizeof(host)) { fprintf(stderr, "hostname too long\n"); return 1; }
+    strncpy(host, input, hlen); host[hlen] = '\0';
+    strncpy(port, sep + 1, sizeof(port) - 1); port[sizeof(port)-1] = '\0';
+
+    int sockfd = setup_socket_bind(host, port);
+    if (sockfd < 0) { perror("setup_socket_bind"); return 1; }
+
+    // Minimal startup print (required by tester)
+    printf("UDP server on %s:%s\n", host, port);
+    fflush(stdout);
+
+    std::map<ClientKey, ClientState> clients;
+
+    while (1) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(sockfd, &rfds);
+        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 5000; // 5ms
+        int rv = select(sockfd + 1, &rfds, NULL, NULL, &tv);
+        time_t now = time(NULL);
+
+        // cleanup stale clients periodically
+        static int cleanup_counter = 0;
+        if (++cleanup_counter >= 1000) {
+            cleanup_counter = 0;
+            std::vector<ClientKey> to_del;
+            for (auto &p : clients) {
+                if (p.second.waiting && (now - p.second.timestamp) > 10) {
+                    to_del.push_back(p.first);
+                }
+            }
+            for (auto &k : to_del) clients.erase(k);
+        }
+
+        if (rv <= 0) continue;
+        if (!FD_ISSET(sockfd, &rfds)) continue;
+
+        char buf[1024];
+        struct sockaddr_storage cliaddr;
+        socklen_t clilen = sizeof(cliaddr);
+        ssize_t n = recvfrom(sockfd, buf, sizeof(buf), 0, (struct sockaddr*)&cliaddr, &clilen);
+        if (n <= 0) continue;
+
+        ClientKey key; memset(&key, 0, sizeof(key));
+        // Copy only the actual address bytes we received and zero the rest
+        if (clilen <= (socklen_t)sizeof(key.ss)) {
+            memcpy(&key.ss, &cliaddr, clilen);
+            if (clilen < (socklen_t)sizeof(key.ss)) memset(((char*)&key.ss) + clilen, 0, sizeof(key.ss) - clilen);
+        } else {
+            memcpy(&key.ss, &cliaddr, sizeof(key.ss));
+        }
+        key.len = clilen;
+
+        auto it = clients.find(key);
+        bool client_exists = (it != clients.end());
+
+        // If message size is neither calcProtocol nor calcMessage, test whether printable text
+        if (n != (ssize_t)CP_SIZE && n != (ssize_t)CM_SIZE) {
+            bool printable = true;
+            for (ssize_t i = 0; i < n; ++i) {
+                unsigned char c = (unsigned char)buf[i];
+                if (c < 9 || (c > 13 && c < 32) || c == 127) { printable = false; break; }
+            }
+            if (!printable) {
+                // Malformed binary/intermediate size -> reply binary NOT-OK (calcMessage with message=2)
+                send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                continue;
+            }
+            // else treat as text protocol
+        }
+
+        // Try binary (calcProtocol)
+        if (n == (ssize_t)CP_SIZE) {
+            // Parse calcProtocol from wire buffer
+            calcProtocol cp_host{};
+            const unsigned char *b = (const unsigned char*)buf;
+            cp_host.type = read_u16_be(b + 0);
+            cp_host.major_version = read_u16_be(b + 2);
+            cp_host.minor_version = read_u16_be(b + 4);
+            cp_host.id = read_u32_be(b + 6);
+            cp_host.arith = read_u32_be(b +10);
+            cp_host.inValue1 = read_u32_be(b +14);
+            cp_host.inValue2 = read_u32_be(b +18);
+            cp_host.inResult = read_u32_be(b +22);
+
+            // Empty/invalid binary hello -> send binary error
+            if (!client_exists && !is_valid_binary_protocol(cp_host)) {
+                send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                continue;
+            }
+
+            if (!client_exists) {
+                // New binary client: assign task, send calcProtocol
+                ClientState cs{}; cs.is_binary = true; cs.waiting = true; cs.timestamp = now;
+                uint32_t code = (rand() % 4) + 1;
+                int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
+                int32_t expected = (code==1? a+b : code==2? a-b : code==3? a*b : a/b);
+                uint32_t id = (uint32_t)(rand() ^ time(NULL));
+                cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
+                clients[key] = cs;
+
+                calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1;
+                out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
+                send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                continue;
+            } else {
+                // Existing binary client: validate answer
+                ClientState &cs = it->second;
+                if (cp_host.id != cs.task_id) {
+                    send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                } else if ((now - cs.timestamp) > 10) {
+                    send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                } else {
+                    int32_t received_result = (int32_t)cp_host.inResult;
+                    if (received_result == cs.expected) send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 1);
+                    else send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                }
+                clients.erase(it);
+                continue;
+            }
+        }
+
+        // If size matches calcMessage (binary), parse/wrap behavior:
+        if (n == (ssize_t)CM_SIZE) {
+            const unsigned char *mb = (const unsigned char*)buf;
+            uint16_t m_type = read_u16_be(mb + 0);
+            uint32_t m_message = read_u32_be(mb + 2);
+            uint16_t m_protocol = read_u16_be(mb + 6);
+            uint16_t m_maj = read_u16_be(mb + 8);
+            uint16_t m_min = read_u16_be(mb +10);
+
+            // If it's a truly empty calcMessage, respond with binary NOT-OK
+            if (!client_exists && m_type == 0 && m_message == 0 && m_protocol == 0 && m_maj == 0 && m_min == 0) {
+                send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                continue;
+            }
+
+            // If this is a registration / hello (non-empty calcMessage) and new client, treat as binary hello
+            if (!client_exists) {
+                ClientState cs{}; cs.is_binary = true; cs.waiting = true; cs.timestamp = now;
+                uint32_t code = (rand() % 4) + 1;
+                int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
+                int32_t expected = (code==1? a+b : code==2? a-b : code==3? a*b : a/b);
+                uint32_t id = (uint32_t)(rand() ^ time(NULL));
+                cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
+                clients[key] = cs;
+
+                calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1;
+                out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
+                send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                continue;
+            }
+
+            // If client exists and sent a calcMessage mid-dialog, it's unexpected for binary flow -> reply binary NOT-OK
+            if (client_exists) {
+                send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                // do not erase client here; wait for proper response
+                continue;
+            }
+        }
+
+        // Text protocol handling
+        string s(buf, n);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+
+        if (!client_exists) {
+            // New text client: send task (text)
+            ClientState cs{}; cs.is_binary = false; cs.waiting = true; cs.timestamp = now;
+            uint32_t code = (rand() % 4) + 1;
+            int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
+            int32_t expected = (code==1? a+b : code==2? a-b : code==3? a*b : a/b);
+            uint32_t id = (uint32_t)(rand() ^ time(NULL));
+            cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
+            clients[key] = cs;
+
+            const char *opstr = (code==1? "add" : code==2? "sub" : code==3? "mul" : "div");
+            char outmsg[128]; int len = snprintf(outmsg, sizeof(outmsg), "%u %s %d %d\n", id, opstr, a, b);
+            sendto(sockfd, outmsg, len, 0, (struct sockaddr*)&cliaddr, clilen);
+        } else {
+            // Existing text client: parse "id result"
+            ClientState &cs = it->second;
+            uint32_t id = 0; int32_t res = 0;
+            if (sscanf(s.c_str(), "%u %d", &id, &res) == 2) {
+                if (id != cs.task_id) {
+                    const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                } else if ((now - cs.timestamp) > 10) {
+                    const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                    clients.erase(it);
+                } else {
+                    if (res == cs.expected) {
+                        const char *ok = "OK\n"; sendto(sockfd, ok, strlen(ok), 0, (struct sockaddr*)&cliaddr, clilen);
+                    } else {
+                        const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
+                    }
+                    clients.erase(it);
+                }
+            } else {
+                const char *err = "ERROR PARSE\n"; sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+            }
+        }
+    }
+
+    close(sockfd);
+    return 0;
+}
