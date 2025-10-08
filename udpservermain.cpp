@@ -89,6 +89,10 @@ static int setup_socket_bind(const char *host_in, const char *port) {
         if (rp->ai_family != hints.ai_family) continue; // only bind to requested family
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd == -1) continue;
+        int reuse = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+            perror("setsockopt(SO_REUSEADDR) failed");
+        }
         int buf = 4 * 1024 * 1024;
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
@@ -173,7 +177,7 @@ int main(int argc, char *argv[]) {
             cleanup_counter = 0;
             std::vector<ClientKey> to_del;
             for (auto &p : clients) {
-                if (p.second.waiting && (now - p.second.timestamp) > 10) {
+                if (p.second.waiting && (now - p.second.timestamp) > 60) {
                     to_del.push_back(p.first);
                 }
             }
