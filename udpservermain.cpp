@@ -326,16 +326,14 @@ int main(int argc, char *argv[]) {
             clients[key] = cs;
 
             const char *opstr = (code==1? "add" : code==2? "sub" : code==3? "mul" : "div");
-            char outmsg[128]; int len = snprintf(outmsg, sizeof(outmsg), "%u %s %d %d\n", id, opstr, a, b);
+            char outmsg[128]; int len = snprintf(outmsg, sizeof(outmsg), "%s %d %d\n", opstr, a, b);
             sendto(sockfd, outmsg, len, 0, (struct sockaddr*)&cliaddr, clilen);
         } else {
-            // Existing text client: parse "id result"
+            // Existing text client: parse "result"
             ClientState &cs = it->second;
-            uint32_t id = 0; int32_t res = 0;
-            if (sscanf(s.c_str(), "%u %d", &id, &res) == 2) {
-                if (id != cs.task_id) {
-                    const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
-                } else if ((now - cs.timestamp) > 10) {
+            int32_t res = 0;
+            if (sscanf(s.c_str(), "%d", &res) == 1) {
+                if ((now - cs.timestamp) > 60) {
                     const char *nok = "NOT OK\n"; sendto(sockfd, nok, strlen(nok), 0, (struct sockaddr*)&cliaddr, clilen);
                     clients.erase(it);
                 } else {
