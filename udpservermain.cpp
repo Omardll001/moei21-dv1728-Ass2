@@ -214,8 +214,9 @@ int main(int argc, char *argv[]) {
                 if (c < 9 || (c > 13 && c < 32) || c == 127) { printable = false; break; }
             }
             if (!printable) {
-                // Malformed binary/intermediate size -> reply binary NOT-OK (calcMessage with message=2)
-                send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                // Malformed binary/intermediate size -> reply with a text error for robustness.
+                const char *err = "ERROR PARSE\n";
+                sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
                 continue;
             }
             // else treat as text protocol
@@ -242,18 +243,9 @@ int main(int argc, char *argv[]) {
             }
 
             if (!client_exists) {
-                // New binary client: assign task, send calcProtocol
-                ClientState cs{}; cs.is_binary = true; cs.waiting = true; cs.timestamp = now;
-                uint32_t code = (rand() % 4) + 1;
-                int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
-                int32_t expected = (code==1? a+b : code==2? a-b : code==3? a*b : a/b);
-                uint32_t id = (uint32_t)(rand() ^ time(NULL));
-                cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
-                clients[key] = cs;
-
-                calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1;
-                out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
-                send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                // This is a response from a client that has already been timed out and removed.
+                // The client is sending a valid calcProtocol, but we don't have a state for it.
+                // Instead of treating it as a new client, we should ignore it to prevent errors.
                 continue;
             } else {
                 // Existing binary client: validate answer
