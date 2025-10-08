@@ -280,17 +280,23 @@ int main(int argc, char *argv[]) {
 
             // If this is a registration / hello (non-empty calcMessage) and new client, treat as binary hello
             if (!client_exists) {
-                ClientState cs{}; cs.is_binary = true; cs.waiting = true; cs.timestamp = now;
-                uint32_t code = (rand() % 4) + 1;
-                int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
-                int32_t expected = (code==1? a+b : code==2? a-b : code==3? a*b : a/b);
-                uint32_t id = (uint32_t)(rand() ^ time(NULL));
-                cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
-                clients[key] = cs;
+                // Stricter check for binary hello based on protocol description
+                if (m_type == 22 && m_protocol == 17) {
+                    ClientState cs{}; cs.is_binary = true; cs.waiting = true; cs.timestamp = now;
+                    uint32_t code = (rand() % 4) + 1;
+                    int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
+                    int32_t expected = (code==1? a+b : code==2? a-b : code==3? a*b : a/b);
+                    uint32_t id = (uint32_t)(rand() ^ time(NULL));
+                    cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
+                    clients[key] = cs;
 
-                calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1;
-                out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
-                send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                    calcProtocol out{}; out.type = 1; out.major_version = 1; out.minor_version = 1;
+                    out.id = id; out.arith = code; out.inValue1 = a; out.inValue2 = b; out.inResult = 0;
+                    send_calcProtocol_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, out);
+                } else {
+                    // Not a valid binary hello, treat as malformed
+                    send_calcMessage_udp(sockfd, (struct sockaddr*)&cliaddr, clilen, 2);
+                }
                 continue;
             }
 
@@ -307,8 +313,14 @@ int main(int argc, char *argv[]) {
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
 
         if (!client_exists) {
-            // New text client. The first message from a text client should be "TEXT".
-            if (s == "TEXT") {
+            // New text client. The first message from a text client should be a request for a task.
+            // The client sends "TEXT" or similar to initiate. Here we are getting a malformed request.
+            // A simple way to handle this is to check if the message is a valid number, which it shouldn't be for a new client.
+            int32_t res;
+            if (sscanf(s.c_str(), "%d", &res) == 1) {
+                 // This is likely an answer from a client we timed out. Send error.
+                const char *err = "ERROR PARSE\n"; sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+            } else {
                 // New text client: send task (text)
                 ClientState cs{}; cs.is_binary = false; cs.waiting = true; cs.timestamp = now;
                 uint32_t code = (rand() % 4) + 1;
@@ -320,9 +332,6 @@ int main(int argc, char *argv[]) {
                 const char *opstr = (code==1? "add" : code==2? "sub" : code==3? "mul" : "div");
                 char outmsg[128]; int len = snprintf(outmsg, sizeof(outmsg), "%s %d %d\n", opstr, a, b);
                 sendto(sockfd, outmsg, len, 0, (struct sockaddr*)&cliaddr, clilen);
-            } else {
-                 // This is a malformed request or an answer from a client we timed out. Send error.
-                const char *err = "ERROR\n"; sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
             }
         } else {
             // Existing text client: parse "result"
