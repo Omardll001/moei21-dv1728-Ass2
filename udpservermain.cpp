@@ -316,18 +316,26 @@ int main(int argc, char *argv[]) {
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
 
         if (!client_exists) {
-            // New text client: send task (text)
-            ClientState cs{}; cs.is_binary = false; cs.waiting = true; cs.timestamp = now;
-            uint32_t code = (rand() % 4) + 1;
-            int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
-            int32_t expected = (code==1? a+b : code==2? a-b : code==3? a*b : a/b);
-            uint32_t id = (uint32_t)(rand() ^ time(NULL));
-            cs.task_id = id; cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
-            clients[key] = cs;
+            // New text client. The first message from a text client should be a request for a task.
+            // The client sends "TEXT" or similar to initiate. Here we are getting a malformed request.
+            // A simple way to handle this is to check if the message is a valid number, which it shouldn't be for a new client.
+            int32_t res;
+            if (sscanf(s.c_str(), "%d", &res) == 1) {
+                 // This is likely an answer from a client we timed out. Send error.
+                const char *err = "ERROR PARSE\n"; sendto(sockfd, err, strlen(err), 0, (struct sockaddr*)&cliaddr, clilen);
+            } else {
+                // New text client: send task (text)
+                ClientState cs{}; cs.is_binary = false; cs.waiting = true; cs.timestamp = now;
+                uint32_t code = (rand() % 4) + 1;
+                int32_t a = randomInt(); int32_t b = randomInt(); if (code == 4 && b == 0) b = 1;
+                int32_t expected = (code==1? a+b : code==2? a-b : code==3? a*b : a/b);
+                cs.expected = expected; cs.v1 = a; cs.v2 = b; cs.arith = code;
+                clients[key] = cs;
 
-            const char *opstr = (code==1? "add" : code==2? "sub" : code==3? "mul" : "div");
-            char outmsg[128]; int len = snprintf(outmsg, sizeof(outmsg), "%s %d %d\n", opstr, a, b);
-            sendto(sockfd, outmsg, len, 0, (struct sockaddr*)&cliaddr, clilen);
+                const char *opstr = (code==1? "add" : code==2? "sub" : code==3? "mul" : "div");
+                char outmsg[128]; int len = snprintf(outmsg, sizeof(outmsg), "%s %d %d\n", opstr, a, b);
+                sendto(sockfd, outmsg, len, 0, (struct sockaddr*)&cliaddr, clilen);
+            }
         } else {
             // Existing text client: parse "result"
             ClientState &cs = it->second;
